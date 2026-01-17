@@ -430,6 +430,91 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.info(f"⏭️ Duplicate submission ignored: msg={message_id} (already in database)")
 
 
+async def handle_forwarded_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handle forwarded messages in DM (manual counting feature).
+
+    When an admin forwards a PnL card photo to the bot's DM:
+    1. Extracts the original sender from forward metadata
+    2. Counts it as a submission
+    3. Replies with confirmation
+
+    This is the fallback method when automatic scanning doesn't work.
+    """
+    message = update.message
+
+    # Only work in private chats (DMs)
+    if message.chat.type != 'private':
+        return
+
+    # Only admins can use this feature
+    if not is_admin(message.from_user.id):
+        return
+
+    # Must be a forwarded message
+    if not message.forward_from and not message.forward_sender_name:
+        return
+
+    # Must have a photo
+    if not message.photo:
+        return
+
+    logger.info(f"📨 Forwarded PnL card received from admin {message.from_user.id}")
+
+    # Extract original user info
+    if message.forward_from:
+        # Full user object available
+        original_user_id = message.forward_from.id
+        original_username = message.forward_from.username or "Unknown"
+        original_full_name = message.forward_from.full_name or "Unknown"
+    else:
+        # Privacy settings hide user, only name available
+        await message.reply_text(
+            "⚠️ Cannot count this PnL card\n\n"
+            "The original sender has privacy settings enabled that hide their user info.\n"
+            "They need to allow forwarding with user info, or post directly in the topic."
+        )
+        return
+
+    # Get photo_id
+    photo_id = message.photo[-1].file_id
+
+    # Use forwarded message ID (or current message ID as fallback)
+    message_id = message.forward_from_message_id or message.message_id
+
+    # Get timestamp
+    timestamp = message.forward_date or message.date
+
+    # Add submission
+    added = add_submission(
+        user_id=original_user_id,
+        username=original_username,
+        full_name=original_full_name,
+        message_id=message_id,
+        photo_id=photo_id,
+        timestamp=timestamp
+    )
+
+    if added:
+        # Get updated total
+        data = load_submissions()
+        total_points = data['users'][str(original_user_id)]['total_points']
+
+        await message.reply_text(
+            f"✅ Point added!\n\n"
+            f"👤 User: @{original_username}\n"
+            f"📊 Total points: {total_points}"
+        )
+        logger.info(f"✅ Manual forward counted: {original_username} ({original_user_id})")
+    else:
+        await message.reply_text(
+            f"⏭️ Already counted\n\n"
+            f"This PnL card was already counted for @{original_username}\n"
+            f"(Duplicate photo or message ID)"
+        )
+        logger.info(f"⏭️ Manual forward duplicate: {original_username}")
+
+
 # ============================================================================
 # PUBLIC COMMANDS
 # ============================================================================
@@ -680,7 +765,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"\n⏳ This may take a few minutes. Admins will see probe messages briefly (auto-deleted).\n\n"
         f"📊 Filter criteria:\n"
         f"✅ Photos only\n"
-        f"✅ Campaign dates: Jan 15 - Feb 11, 2025\n"
+        f"✅ All time (no date filtering)\n"
         f"✅ From chat {CHAT_ID}\n"
         f"💡 Tight message ID range recommended for best results!"
     )
@@ -845,6 +930,172 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+@admin_only
+@dm_only
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /reset command - Reset all points to zero with confirmation
+    Admin only, DM only
+
+    WARNING: This wipes ALL points but keeps user list for duplicate detection.
+    Creates backup before reset.
+    """
+    # Check if this is a confirmation
+    if context.args and context.args[0] == 'CONFIRM':
+        # Perform reset
+        data = load_submissions()
+
+        # Create backup timestamp
+        from datetime import datetime
+        backup_time = datetime.now(IST).strftime('%Y%m%d_%H%M%S')
+
+        # Save backup with timestamp
+        import json
+        from pathlib import Path
+        backup_file = Path(f"/app/data/submissions_reset_backup_{backup_time}.json")
+        with open(backup_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        logger.info(f"Created reset backup: {backup_file}")
+
+        # Reset all points
+        total_users = 0
+        total_cleared = 0
+
+        for user_id, user_data in data['users'].items():
+            if user_data['total_points'] > 0:
+                total_cleared += user_data['total_points']
+                total_users += 1
+
+            # Clear points but keep user data for duplicate detection
+            user_data['total_points'] = 0
+            user_data['submissions'] = []
+            user_data['unique_photos'] = []
+
+        # Reset global stats
+        data['stats']['total_submissions'] = 0
+        data['stats']['last_updated'] = format_timestamp(datetime.now(IST))
+
+        # Save atomically
+        from data_manager import save_submissions
+        save_submissions(data)
+
+        await update.message.reply_text(
+            f"✅ Reset Complete!\n\n"
+            f"📊 Cleared {total_cleared} points from {total_users} users\n"
+            f"💾 Backup saved to: submissions_reset_backup_{backup_time}.json\n\n"
+            f"Users remain in database for duplicate photo detection.\n"
+            f"Leaderboard is now empty. Points will start fresh!"
+        )
+
+        logger.warning(f"RESET EXECUTED by admin {update.effective_user.id} - {total_cleared} points cleared")
+
+    else:
+        # Show confirmation prompt
+        data = load_submissions()
+        total_points = sum(user['total_points'] for user in data['users'].values())
+        total_users = data['stats']['total_participants']
+
+        await update.message.reply_text(
+            f"⚠️ RESET WARNING ⚠️\n\n"
+            f"This will:\n"
+            f"❌ Wipe {total_points} points from {total_users} users\n"
+            f"❌ Clear all submission history\n"
+            f"❌ Reset leaderboard to empty\n"
+            f"✅ Keep user list (for duplicate detection)\n"
+            f"✅ Create backup before reset\n\n"
+            f"To confirm, type:\n"
+            f"/reset CONFIRM"
+        )
+
+
+@admin_only
+async def cmd_scantopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /scantopic command - Auto-scan current topic for PnL cards
+    Admin only - MUST be run IN the topic you want to scan!
+
+    This command:
+    1. Detects which topic you're in
+    2. Automatically determines message ID range
+    3. Scans ONLY that topic for photos
+
+    Example: Just type /scantopic in the PnL Flex Challenge topic
+    """
+    message = update.message
+
+    # Check if in a topic (not DM)
+    if message.chat.type == 'private':
+        await message.reply_text(
+            "⚠️ This command must be run IN a topic\n\n"
+            "Usage:\n"
+            "1. Go to the PnL Flex Challenge topic\n"
+            "2. Type /scantopic there\n"
+            "3. Bot will auto-scan that topic only\n\n"
+            f"💡 Expected topic ID: {TOPIC_ID}"
+        )
+        return
+
+    # Get topic ID
+    topic_id = message.message_thread_id
+
+    if not topic_id:
+        await message.reply_text(
+            "⚠️ This doesn't appear to be a topic\n\n"
+            "Make sure you're in a forum topic, not the main chat."
+        )
+        return
+
+    # Warn if not the PnL Flex Challenge topic
+    if topic_id != TOPIC_ID:
+        await message.reply_text(
+            f"⚠️ WARNING: You're in topic {topic_id}\n"
+            f"Expected PnL Flex Challenge topic: {TOPIC_ID}\n\n"
+            "The bot will scan this topic anyway.\n"
+            "Make sure this is the correct topic!"
+        )
+
+    # Auto-determine message ID range
+    # Strategy: Use the current message ID as a reference point
+    # Scan backwards and forwards from topic start
+    current_msg_id = message.message_id
+
+    # For most topics, scan from topic_id (first message) to current message + buffer
+    # This assumes topic_id is close to the first message ID in the topic
+    start_id = topic_id  # Topic ID is usually close to first message
+    end_id = current_msg_id + 1000  # Scan ahead for future messages
+
+    scan_range = end_id - start_id
+
+    if scan_range > 5000:
+        await message.reply_text(
+            f"⚠️ Auto-detected range too large ({scan_range} messages)\n\n"
+            f"Please use /scan command with specific IDs instead:\n"
+            f"/scan {start_id} {start_id + 5000}\n\n"
+            f"Or find precise message IDs by right-clicking PnL cards."
+        )
+        return
+
+    await message.reply_text(
+        f"🔄 Auto-scanning topic {topic_id}\n\n"
+        f"📡 Detected range: {start_id} to {end_id}\n"
+        f"📊 Scanning ~{scan_range} message IDs\n"
+        f"✅ Photos only\n"
+        f"✅ From this topic only\n\n"
+        f"⏳ This may take a few minutes...\n"
+        f"You'll see probe messages briefly (auto-deleted)."
+    )
+
+    # Run backfill with detected range
+    context.bot_data['scan_topic_hint'] = topic_id
+    await smart_backfill(context.application, scan_range=(start_id, end_id))
+
+    await message.reply_text(
+        f"✅ Topic scan complete!\n\n"
+        f"Use /pnlrank to see updated leaderboard."
+    )
+
+
 # ============================================================================
 # STARTUP & MAIN
 # ============================================================================
@@ -883,6 +1134,14 @@ def main():
         )
     )
 
+    # Add forwarded message handler (manual counting in DM)
+    application.add_handler(
+        MessageHandler(
+            filters.PHOTO & filters.ChatType.PRIVATE & filters.FORWARDED,
+            handle_forwarded_message
+        )
+    )
+
     # Add public commands (case-insensitive)
     application.add_handler(
         CommandHandler(
@@ -900,6 +1159,8 @@ def main():
     application.add_handler(CommandHandler('winners', cmd_winners))
     application.add_handler(CommandHandler('backfill', cmd_backfill))
     application.add_handler(CommandHandler('scan', cmd_scan))
+    application.add_handler(CommandHandler('scantopic', cmd_scantopic))
+    application.add_handler(CommandHandler('reset', cmd_reset))
     application.add_handler(CommandHandler('checkmsg', cmd_checkmsg))
     application.add_handler(CommandHandler('debug', cmd_debug))
     application.add_handler(CommandHandler('stats', cmd_stats))
