@@ -630,27 +630,39 @@ async def cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
-@dm_only
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /scan <start_id> <end_id> command - Scan specific message ID range
-    Admin only, DM only
+    Admin only - USE THIS COMMAND IN THE TOPIC YOU WANT TO SCAN!
 
     Example: /scan 103380 103580
     """
+    # Check if command is used in the campaign topic or DM
+    command_topic_id = update.message.message_thread_id if update.message.chat.type != 'private' else None
+
     # Parse arguments
     if not context.args or len(context.args) != 2:
-        await update.message.reply_text(
+        help_text = (
             "📡 Usage: /scan <start_id> <end_id>\n\n"
             "Example: /scan 103380 103580\n\n"
-            "⚠️ IMPORTANT:\n"
-            "• Only scan messages from YOUR topic\n"
-            "• Find start ID: Right-click FIRST message in topic → Copy Link\n"
-            "• Find end ID: Right-click LATEST message in topic → Copy Link\n"
-            "• Use a tight range to avoid other topics!\n\n"
-            f"💡 Your topic ID is: {TOPIC_ID}\n"
-            f"Usually starts around: {TOPIC_ID} (topic creation message)"
+            "⚠️ IMPORTANT - Run this command IN the topic you want to scan!\n"
+            "• Go to PnL Flex Challenge topic\n"
+            "• Find start ID: Right-click FIRST PnL card → Copy Link\n"
+            "• Find end ID: Right-click LATEST PnL card → Copy Link\n"
+            "• Type /scan <start> <end> IN THAT TOPIC\n\n"
         )
+
+        if command_topic_id:
+            help_text += f"✅ Current topic ID: {command_topic_id}\n"
+            if command_topic_id == TOPIC_ID:
+                help_text += "✅ This is the correct PnL Flex Challenge topic!\n"
+            else:
+                help_text += f"⚠️ Expected topic ID: {TOPIC_ID}\n"
+        else:
+            help_text += f"💡 Expected topic ID: {TOPIC_ID}\n"
+            help_text += "⚠️ You're in DM. Better to run in the topic itself!\n"
+
+        await update.message.reply_text(help_text)
         return
 
     try:
@@ -667,21 +679,114 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Invalid range: {e}")
         return
 
-    await update.message.reply_text(
+    # Warn if not in the correct topic
+    if command_topic_id and command_topic_id != TOPIC_ID:
+        await update.message.reply_text(
+            f"⚠️ WARNING: You're in topic {command_topic_id}\n"
+            f"Expected: {TOPIC_ID} (PnL Flex Challenge)\n\n"
+            f"This scan will look for messages from topic {TOPIC_ID}, "
+            f"but you should run this command IN that topic for better accuracy!"
+        )
+
+    status_msg = (
         f"🔄 Starting scan of {end_id - start_id} message IDs...\n"
-        f"📡 Range: {start_id} to {end_id}\n\n"
-        f"⚠️ Make sure this range ONLY contains messages from topic {TOPIC_ID}\n"
-        f"⏳ This may take a few minutes. You'll see probe messages briefly (auto-deleted).\n\n"
+        f"📡 Range: {start_id} to {end_id}\n"
+    )
+
+    if command_topic_id:
+        status_msg += f"📍 Command sent from topic: {command_topic_id}\n"
+        if command_topic_id == TOPIC_ID:
+            status_msg += "✅ Correct topic!\n"
+
+    status_msg += (
+        f"\n⏳ This may take a few minutes. Admins will see probe messages briefly (auto-deleted).\n\n"
         f"📊 Filter criteria:\n"
         f"✅ Photos only\n"
         f"✅ Campaign dates: Jan 15 - Feb 11, 2025\n"
-        f"✅ From your group chat"
+        f"✅ From chat {CHAT_ID}\n"
+        f"💡 Tight message ID range recommended for best results!"
     )
 
+    await update.message.reply_text(status_msg)
+
     # Run backfill with custom range
+    # Store the topic ID context for better filtering hints
+    context.bot_data['scan_topic_hint'] = command_topic_id
     await smart_backfill(context.application, scan_range=(start_id, end_id))
 
-    await update.message.reply_text("✅ Scan complete! Check results above.")
+    # Send completion message to the same chat where command was issued
+    await update.message.reply_text("✅ Scan complete! Use /pnlrank to see updated leaderboard.")
+
+
+@admin_only
+async def cmd_checkmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /checkmsg <message_id> - Check if a message ID is from the PnL topic
+    Admin only - helps find correct message range
+
+    Example: /checkmsg 103450
+    """
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text(
+            "Usage: /checkmsg <message_id>\n\n"
+            "Example: /checkmsg 103450\n\n"
+            "This helps you verify if a message ID is from the PnL Flex Challenge topic.\n"
+            "Use this to find the correct first/last message IDs for /scan."
+        )
+        return
+
+    try:
+        msg_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid message ID")
+        return
+
+    try:
+        # Try to forward the message to probe it
+        probe_chat_id = ADMIN_IDS[0]
+
+        forwarded = await context.bot.forward_message(
+            chat_id=probe_chat_id,
+            from_chat_id=CHAT_ID,
+            message_id=msg_id
+        )
+
+        # Analyze the message
+        info = f"✅ Message {msg_id} found!\n\n"
+
+        if forwarded.photo:
+            info += "📷 Type: Photo ✅\n"
+        else:
+            info += f"📝 Type: {forwarded.content_type}\n"
+
+        if forwarded.forward_date:
+            info += f"📅 Date: {forwarded.forward_date.strftime('%Y-%m-%d %H:%M:%S')}\n"
+
+            # Check if in campaign period
+            if CAMPAIGN_START <= forwarded.forward_date <= CAMPAIGN_END:
+                info += "✅ Within campaign period!\n"
+            else:
+                info += "⚠️ Outside campaign period\n"
+
+        if forwarded.forward_from:
+            info += f"👤 From: {forwarded.forward_from.full_name}\n"
+
+        info += f"\n💡 Original chat: {CHAT_ID}\n"
+        info += f"💡 Target topic: {TOPIC_ID}\n"
+
+        # Delete the forwarded probe
+        try:
+            await context.bot.delete_message(
+                chat_id=probe_chat_id,
+                message_id=forwarded.message_id
+            )
+        except Exception:
+            pass
+
+        await update.message.reply_text(info)
+
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ Message {msg_id} not found or inaccessible\n\nError: {e}")
 
 
 @admin_only
@@ -760,6 +865,7 @@ def main():
     application.add_handler(CommandHandler('winners', cmd_winners))
     application.add_handler(CommandHandler('backfill', cmd_backfill))
     application.add_handler(CommandHandler('scan', cmd_scan))
+    application.add_handler(CommandHandler('checkmsg', cmd_checkmsg))
     application.add_handler(CommandHandler('stats', cmd_stats))
 
     # Start bot
