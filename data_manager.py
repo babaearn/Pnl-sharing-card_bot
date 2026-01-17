@@ -170,11 +170,12 @@ def save_config(data):
     save_json_atomic(CONFIG_FILE, data)
 
 
-def add_submission(user_id, username, full_name, message_id, photo_id, timestamp, week):
+def add_submission(user_id, username, full_name, message_id, photo_id, timestamp):
     """
-    Add a new submission to the database.
+    Add a new submission to the database (TIME-INDEPENDENT VERSION).
 
     This is an idempotent operation - if message_id already exists, it's skipped.
+    NO WEEK TRACKING - counts all photos regardless of date.
 
     Args:
         user_id: Telegram user ID
@@ -183,7 +184,6 @@ def add_submission(user_id, username, full_name, message_id, photo_id, timestamp
         message_id: Unique Telegram message ID
         photo_id: Telegram file_id for duplicate detection
         timestamp: datetime object
-        week: Week number (1-4)
 
     Returns:
         bool: True if submission was added, False if duplicate
@@ -199,8 +199,7 @@ def add_submission(user_id, username, full_name, message_id, photo_id, timestamp
             "first_seen": format_timestamp(timestamp),
             "unique_photos": [],
             "submissions": [],
-            "total_points": 0,
-            "weekly_points": {}
+            "total_points": 0
         }
         data['stats']['total_participants'] += 1
 
@@ -221,17 +220,14 @@ def add_submission(user_id, username, full_name, message_id, photo_id, timestamp
     user_data['submissions'].append({
         "message_id": message_id,
         "photo_id": photo_id,
-        "timestamp": format_timestamp(timestamp),
-        "week": week
+        "timestamp": format_timestamp(timestamp)
     })
 
     # Add photo to unique list
     user_data['unique_photos'].append(photo_id)
 
-    # Update points
+    # Update points (all-time cumulative)
     user_data['total_points'] += 1
-    week_str = str(week)
-    user_data['weekly_points'][week_str] = user_data['weekly_points'].get(week_str, 0) + 1
 
     # Update username/full_name if changed
     user_data['username'] = username or user_data['username']
@@ -242,29 +238,26 @@ def add_submission(user_id, username, full_name, message_id, photo_id, timestamp
 
     # Save atomically
     save_submissions(data)
-    logger.info(f"Added submission for user {user_id} (message {message_id}, week {week})")
+    logger.info(f"Added submission for user {user_id} (message {message_id})")
 
     return True
 
 
-def get_leaderboard(week=None):
+def get_leaderboard(limit=None):
     """
-    Get leaderboard for specific week or all-time.
+    Get all-time leaderboard (TIME-INDEPENDENT).
 
     Args:
-        week: Week number (1-4) or None for all-time
+        limit: Maximum number of entries to return (None for all)
 
     Returns:
-        list: Sorted list of (user_id, username, full_name, points)
+        list: Sorted list of dictionaries with user_id, username, full_name, points
     """
     data = load_submissions()
     leaderboard = []
 
     for user_id, user_data in data['users'].items():
-        if week is None:
-            points = user_data['total_points']
-        else:
-            points = user_data['weekly_points'].get(str(week), 0)
+        points = user_data['total_points']
 
         if points > 0:  # Only include users with points
             leaderboard.append({
@@ -277,6 +270,8 @@ def get_leaderboard(week=None):
     # Sort by points (descending), then by username (ascending)
     leaderboard.sort(key=lambda x: (-x['points'], x['username'].lower()))
 
+    if limit:
+        return leaderboard[:limit]
     return leaderboard
 
 

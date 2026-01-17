@@ -243,16 +243,7 @@ async def smart_backfill(application: Application, scan_range=None):
                 # Get timestamp (use forward date as approximation)
                 timestamp = forwarded.forward_date or forwarded.date
 
-                # Check if within campaign period
-                if timestamp < CAMPAIGN_START or timestamp > CAMPAIGN_END:
-                    logger.debug(f"Message {msg_id} outside campaign period")
-                    continue
-
-                # Calculate week number
-                week = calculate_week_number(timestamp)
-                if week is None:
-                    logger.warning(f"Could not calculate week for message {msg_id}")
-                    continue
+                # NO TIME FILTERING - count all photos regardless of date
 
                 # Add submission (idempotent)
                 added = add_submission(
@@ -261,14 +252,13 @@ async def smart_backfill(application: Application, scan_range=None):
                     full_name=full_name,
                     message_id=msg_id,
                     photo_id=photo_id,
-                    timestamp=timestamp,
-                    week=week
+                    timestamp=timestamp
                 )
 
                 if added:
                     new_submissions += 1
                     processed_messages.append(msg_id)
-                    logger.info(f"✅ Processed: msg={msg_id}, user={username}, week={week}")
+                    logger.info(f"✅ Processed: msg={msg_id}, user={username}")
 
                 # Delete the forwarded probe message to keep chat clean
                 try:
@@ -308,13 +298,9 @@ async def smart_backfill(application: Application, scan_range=None):
     # Reload data to get updated user count
     data = load_submissions()
 
-    # Get top 3 for notification
-    current_week = get_current_week()
-    if current_week:
-        leaderboard = get_leaderboard(current_week)
-        top_3 = leaderboard[:3] if leaderboard else []
-    else:
-        top_3 = []
+    # Get top 3 for notification (all-time leaderboard)
+    leaderboard = get_leaderboard(limit=3)
+    top_3 = leaderboard if leaderboard else []
 
     # Prepare sync stats
     sync_stats = {
@@ -393,6 +379,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     Handle new photo messages in the campaign topic.
 
     This runs in real-time as users post PnL cards.
+    TIME-INDEPENDENT: Counts ALL photos regardless of date.
     """
     message = update.message
 
@@ -424,34 +411,21 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     # Get photo_id (largest size)
     photo_id = message.photo[-1].file_id
 
-    # Check if message is within campaign period
-    logger.info(f"Message timestamp: {timestamp}, Campaign: {CAMPAIGN_START} to {CAMPAIGN_END}")
-
-    if timestamp < CAMPAIGN_START or timestamp > CAMPAIGN_END:
-        logger.warning(f"⏭️ Message {message_id} outside campaign period (posted: {timestamp}), ignoring")
-        return
-
-    # Calculate week number
-    week = calculate_week_number(timestamp)
-    if week is None:
-        logger.warning(f"Could not calculate week for message {message_id}")
-        return
-
-    logger.info(f"✅ Valid PnL card! User: {username}, Week: {week}, Msg: {message_id}")
+    logger.info(f"✅ Valid PnL card! User: {username}, Msg: {message_id}")
 
     # Add submission (idempotent - checks message_id and photo_id)
+    # NO TIME FILTERING - counts all photos
     added = add_submission(
         user_id=user_id,
         username=username,
         full_name=full_name,
         message_id=message_id,
         photo_id=photo_id,
-        timestamp=timestamp,
-        week=week
+        timestamp=timestamp
     )
 
     if added:
-        logger.info(f"✅✅ NEW SUBMISSION ADDED: user={username} ({user_id}), week={week}, msg={message_id}, points=1")
+        logger.info(f"✅✅ NEW SUBMISSION ADDED: user={username} ({user_id}), msg={message_id}, points=1")
     else:
         logger.info(f"⏭️ Duplicate submission ignored: msg={message_id} (already in database)")
 
@@ -462,22 +436,16 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def cmd_pnlrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /pnlrank command - Show top 5 leaderboard for current week
+    /pnlrank command - Show all-time Top 5 leaderboard
     Case-insensitive, works in group or DM
+    TIME-INDEPENDENT: Shows cumulative all-time rankings
     """
-    current_week = get_current_week()
-
-    if current_week is None:
-        await update.message.reply_text("⏰ Campaign hasn't started yet!")
-        return
-
     # Get config for point visibility
     config = load_config()
     show_points = config.get('show_points', True)
 
-    # Format leaderboard
+    # Format leaderboard (all-time, top 5)
     leaderboard_text = format_leaderboard(
-        week=current_week,
         show_points=show_points,
         limit=5
     )
