@@ -33,7 +33,7 @@ def get_default_submissions():
         "stats": {
             "total_participants": 0,
             "total_submissions": 0,
-            "campaign_start": format_timestamp(datetime(2025, 1, 15, 0, 1, tzinfo=IST)),
+            "campaign_start": format_timestamp(IST.localize(datetime(2025, 1, 15, 0, 1))),
             "last_updated": format_timestamp(datetime.now(IST))
         }
     }
@@ -48,8 +48,8 @@ def get_default_config():
     """Return default structure for config.json"""
     return {
         "show_points": True,
-        "campaign_start": format_timestamp(datetime(2025, 1, 15, 0, 1, tzinfo=IST)),
-        "campaign_end": format_timestamp(datetime(2025, 2, 11, 23, 59, 59, tzinfo=IST))
+        "campaign_start": format_timestamp(IST.localize(datetime(2025, 1, 15, 0, 1))),
+        "campaign_end": format_timestamp(IST.localize(datetime(2025, 2, 11, 23, 59, 59)))
     }
 
 
@@ -345,15 +345,8 @@ def get_engagement_stats(week=None):
     total_users = stats['total_participants']
     avg_posts = total_posts / total_users if total_users > 0 else 0
 
-    # Count new participants this week
+    # New participants this week - not tracked in time-independent mode
     new_this_week = 0
-    if week:
-        for user_id, user_data in data['users'].items():
-            if str(week) in user_data['weekly_points']:
-                # Check if this is their first week
-                weeks_participated = [w for w in user_data['weekly_points'].keys() if user_data['weekly_points'][w] > 0]
-                if len(weeks_participated) == 1 and str(week) in weeks_participated:
-                    new_this_week += 1
 
     # Calculate campaign day
     from datetime import datetime

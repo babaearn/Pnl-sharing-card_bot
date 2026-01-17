@@ -36,8 +36,8 @@ from utils import (
     TOPIC_ID,
     ADMIN_IDS,
     is_admin,
-    calculate_week_number,
     get_current_week,
+    format_timestamp,
     SensitiveFormatter
 )
 from data_manager import (
@@ -546,17 +546,11 @@ async def cmd_pnlrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @dm_only
 async def cmd_adminboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /adminboard command - Show detailed top 10 with user IDs
+    /adminboard command - Show detailed top 10 with user IDs (all-time)
     Admin only, DM only
     """
-    current_week = get_current_week()
-
-    if current_week is None:
-        await update.message.reply_text("⏰ Campaign hasn't started yet!")
-        return
-
-    # Format admin dashboard
-    dashboard_text = format_admin_dashboard(current_week)
+    # Format admin dashboard (all-time leaderboard)
+    dashboard_text = format_admin_dashboard()
 
     await update.message.reply_text(dashboard_text)
 
@@ -624,8 +618,8 @@ async def cmd_selectwinners(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Week must be a number between 1 and 4")
         return
 
-    # Get top 5 for the week
-    leaderboard = get_leaderboard(week)
+    # Get top 5 for the week (all-time since bot is time-independent)
+    leaderboard = get_leaderboard(limit=5)
 
     if not leaderboard:
         await update.message.reply_text(f"❌ No submissions for Week {week}")
@@ -861,49 +855,51 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from datetime import datetime
 
     now = datetime.now(IST)
-    current_week = get_current_week()
+
+    # Get current leaderboard stats
+    data = load_submissions()
+    total_participants = data['stats']['total_participants']
+    total_submissions = data['stats']['total_submissions']
+
+    # Get top user
+    leaderboard = get_leaderboard(limit=1)
+    top_user = leaderboard[0] if leaderboard else None
 
     lines = [
         "🔧 Debug Information",
         "",
-        f"📅 Current Time (IST): {now.strftime('%Y-%m-%d %H:%M:%S %Z')}",
-        f"📅 Campaign Start: {CAMPAIGN_START.strftime('%Y-%m-%d %H:%M:%S %Z')}",
-        f"📅 Campaign End: {CAMPAIGN_END.strftime('%Y-%m-%d %H:%M:%S %Z')}",
-        f"📊 Current Week: {current_week if current_week else 'Not in campaign period'}",
+        "⚙️ BOT MODE: TIME-INDEPENDENT",
+        "✅ All photos counted regardless of date",
+        "✅ No campaign period filtering",
         "",
-    ]
-
-    # Check for system time issues
-    if now.year != 2025:
-        lines.append("⚠️ WARNING: System time is WRONG!")
-        lines.append(f"⚠️ Server thinks it's {now.year}, should be 2025!")
-        lines.append("⚠️ This will cause all messages to be filtered out!")
-        lines.append("⚠️ Contact Railway support to fix server time")
-        lines.append("")
-    elif now < CAMPAIGN_START:
-        lines.append("⏰ Campaign hasn't started yet")
-        lines.append(f"⏰ Starts on: {CAMPAIGN_START.strftime('%Y-%m-%d %H:%M')}")
-        lines.append("")
-    elif now > CAMPAIGN_END:
-        lines.append("⏰ Campaign has ended")
-        lines.append(f"⏰ Ended on: {CAMPAIGN_END.strftime('%Y-%m-%d %H:%M')}")
-        lines.append("")
-    else:
-        lines.append("✅ System time is correct!")
-        lines.append("✅ Campaign is active!")
-        lines.append("")
-
-    lines.extend([
+        f"📅 Server Time (IST): {now.strftime('%Y-%m-%d %H:%M:%S %Z')}",
         f"💬 Target Chat ID: {CHAT_ID}",
         f"🎯 Target Topic ID: {TOPIC_ID}",
         f"👨‍💼 Admin IDs: {', '.join(map(str, ADMIN_IDS))}",
         "",
-        f"✅ Bot is running and receiving commands!",
+        "📊 DATABASE STATS:",
+        f"• Total Participants: {total_participants}",
+        f"• Total Submissions: {total_submissions}",
+    ]
+
+    if top_user:
+        username_display = f"@{top_user['username']}" if top_user['username'] != "Unknown" else top_user['full_name']
+        lines.append(f"• Top User: {username_display} ({top_user['points']} points)")
+
+    lines.extend([
         "",
-        f"💡 To test real-time tracking:",
+        "✅ Bot is running and receiving commands!",
+        "",
+        "💡 To test real-time tracking:",
         f"• Post a PnL card photo in topic {TOPIC_ID}",
         f"• Check Railway logs for '📸 Photo received' message",
-        f"• Should see '✅✅ NEW SUBMISSION ADDED' if successful"
+        f"• Should see '✅✅ NEW SUBMISSION ADDED' if successful",
+        "",
+        "🔧 TROUBLESHOOTING:",
+        "• If photos not counting: Check topic ID matches",
+        "• For historical messages: Use /scan or /scantopic",
+        "• For manual counting: Forward PnL cards to bot DM",
+        "• To reset points: Use /reset command (DM only)"
     ])
 
     await update.message.reply_text("\n".join(lines))

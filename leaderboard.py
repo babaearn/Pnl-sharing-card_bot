@@ -72,34 +72,25 @@ def format_leaderboard(show_points=None, limit=5, show_user_ids=False):
     return "\n".join(lines)
 
 
-def format_admin_dashboard(week=None):
+def format_admin_dashboard():
     """
-    Format detailed admin dashboard with top 10 and configuration.
-
-    Args:
-        week: Week number (1-4) or None for current week
+    Format detailed admin dashboard with top 10 and configuration (all-time).
 
     Returns:
         str: Formatted admin dashboard
     """
-    # Get current week if not specified
-    if week is None:
-        week = get_current_week()
-        if week is None:
-            return "❌ Campaign hasn't started yet!"
-
-    # Get leaderboard data
-    leaderboard = get_leaderboard(week)
+    # Get leaderboard data (all-time, top 10)
+    leaderboard = get_leaderboard(limit=10)
 
     if not leaderboard:
-        return f"📊 No submissions yet for Week {week}"
+        return "📊 No submissions yet"
 
     # Get config
     config = load_config()
     show_points = config.get('show_points', True)
 
     # Build header
-    lines = [f"🔐 Admin Dashboard - Week {week}", ""]
+    lines = ["🔐 Admin Dashboard - All Time", ""]
 
     # Format top 10 with user IDs
     for idx, entry in enumerate(leaderboard[:10], 1):
