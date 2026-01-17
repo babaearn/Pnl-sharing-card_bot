@@ -818,6 +818,29 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📅 Campaign End: {CAMPAIGN_END.strftime('%Y-%m-%d %H:%M:%S %Z')}",
         f"📊 Current Week: {current_week if current_week else 'Not in campaign period'}",
         "",
+    ]
+
+    # Check for system time issues
+    if now.year != 2025:
+        lines.append("⚠️ WARNING: System time is WRONG!")
+        lines.append(f"⚠️ Server thinks it's {now.year}, should be 2025!")
+        lines.append("⚠️ This will cause all messages to be filtered out!")
+        lines.append("⚠️ Contact Railway support to fix server time")
+        lines.append("")
+    elif now < CAMPAIGN_START:
+        lines.append("⏰ Campaign hasn't started yet")
+        lines.append(f"⏰ Starts on: {CAMPAIGN_START.strftime('%Y-%m-%d %H:%M')}")
+        lines.append("")
+    elif now > CAMPAIGN_END:
+        lines.append("⏰ Campaign has ended")
+        lines.append(f"⏰ Ended on: {CAMPAIGN_END.strftime('%Y-%m-%d %H:%M')}")
+        lines.append("")
+    else:
+        lines.append("✅ System time is correct!")
+        lines.append("✅ Campaign is active!")
+        lines.append("")
+
+    lines.extend([
         f"💬 Target Chat ID: {CHAT_ID}",
         f"🎯 Target Topic ID: {TOPIC_ID}",
         f"👨‍💼 Admin IDs: {', '.join(map(str, ADMIN_IDS))}",
@@ -828,7 +851,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Post a PnL card photo in topic {TOPIC_ID}",
         f"• Check Railway logs for '📸 Photo received' message",
         f"• Should see '✅✅ NEW SUBMISSION ADDED' if successful"
-    ]
+    ])
 
     await update.message.reply_text("\n".join(lines))
 

@@ -16,8 +16,9 @@ logger = logging.getLogger(__name__)
 IST = pytz.timezone('Asia/Kolkata')
 
 # Campaign dates in IST
-CAMPAIGN_START = datetime(2025, 1, 15, 0, 1, tzinfo=IST)
-CAMPAIGN_END = datetime(2025, 2, 11, 23, 59, 59, tzinfo=IST)
+# IMPORTANT: Use IST.localize() for proper timezone handling with pytz
+CAMPAIGN_START = IST.localize(datetime(2025, 1, 15, 0, 1))
+CAMPAIGN_END = IST.localize(datetime(2025, 2, 11, 23, 59, 59))
 
 # Chat configuration from environment
 CHAT_ID = int(os.getenv('CHAT_ID', '-1001868775086'))
