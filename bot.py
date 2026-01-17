@@ -396,16 +396,22 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     """
     message = update.message
 
+    # Debug logging
+    logger.info(f"📸 Photo received - Chat: {message.chat_id}, Thread: {message.message_thread_id}, User: {message.from_user.id}")
+
     # Check if message is in the correct chat
     if message.chat_id != CHAT_ID:
+        logger.debug(f"Skipping: Wrong chat ({message.chat_id} != {CHAT_ID})")
         return
 
     # Check if message is in the campaign topic
     if not message.message_thread_id or message.message_thread_id != TOPIC_ID:
+        logger.debug(f"Skipping: Wrong topic ({message.message_thread_id} != {TOPIC_ID})")
         return
 
     # Check if message has photos
     if not message.photo:
+        logger.debug("Skipping: No photo")
         return
 
     # Extract message info
@@ -419,8 +425,10 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     photo_id = message.photo[-1].file_id
 
     # Check if message is within campaign period
+    logger.info(f"Message timestamp: {timestamp}, Campaign: {CAMPAIGN_START} to {CAMPAIGN_END}")
+
     if timestamp < CAMPAIGN_START or timestamp > CAMPAIGN_END:
-        logger.info(f"Message {message_id} outside campaign period, ignoring")
+        logger.warning(f"⏭️ Message {message_id} outside campaign period (posted: {timestamp}), ignoring")
         return
 
     # Calculate week number
@@ -428,6 +436,8 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if week is None:
         logger.warning(f"Could not calculate week for message {message_id}")
         return
+
+    logger.info(f"✅ Valid PnL card! User: {username}, Week: {week}, Msg: {message_id}")
 
     # Add submission (idempotent - checks message_id and photo_id)
     added = add_submission(
@@ -441,9 +451,9 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
     if added:
-        logger.info(f"✅ New submission: user={username} ({user_id}), week={week}, msg={message_id}")
+        logger.info(f"✅✅ NEW SUBMISSION ADDED: user={username} ({user_id}), week={week}, msg={message_id}, points=1")
     else:
-        logger.debug(f"⏭️ Duplicate submission ignored: msg={message_id}")
+        logger.info(f"⏭️ Duplicate submission ignored: msg={message_id} (already in database)")
 
 
 # ============================================================================
@@ -790,6 +800,40 @@ async def cmd_checkmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /debug command - Show debug information
+    Admin only - helps diagnose issues
+    """
+    from datetime import datetime
+
+    now = datetime.now(IST)
+    current_week = get_current_week()
+
+    lines = [
+        "🔧 Debug Information",
+        "",
+        f"📅 Current Time (IST): {now.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        f"📅 Campaign Start: {CAMPAIGN_START.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        f"📅 Campaign End: {CAMPAIGN_END.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        f"📊 Current Week: {current_week if current_week else 'Not in campaign period'}",
+        "",
+        f"💬 Target Chat ID: {CHAT_ID}",
+        f"🎯 Target Topic ID: {TOPIC_ID}",
+        f"👨‍💼 Admin IDs: {', '.join(map(str, ADMIN_IDS))}",
+        "",
+        f"✅ Bot is running and receiving commands!",
+        "",
+        f"💡 To test real-time tracking:",
+        f"• Post a PnL card photo in topic {TOPIC_ID}",
+        f"• Check Railway logs for '📸 Photo received' message",
+        f"• Should see '✅✅ NEW SUBMISSION ADDED' if successful"
+    ]
+
+    await update.message.reply_text("\n".join(lines))
+
+
+@admin_only
 @dm_only
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -866,6 +910,7 @@ def main():
     application.add_handler(CommandHandler('backfill', cmd_backfill))
     application.add_handler(CommandHandler('scan', cmd_scan))
     application.add_handler(CommandHandler('checkmsg', cmd_checkmsg))
+    application.add_handler(CommandHandler('debug', cmd_debug))
     application.add_handler(CommandHandler('stats', cmd_stats))
 
     # Start bot
