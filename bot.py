@@ -713,10 +713,12 @@ async def post_init(application: Application):
     """Run after bot initialization, before start"""
     logger.info("🤖 Bot initialized, running startup tasks...")
 
-    # Run smart backfill on every startup
-    await smart_backfill(application)
+    # DISABLED: Automatic backfill on startup (prevents scanning wrong topics)
+    # Use /scan command manually with correct message ID range for your specific topic
+    # await smart_backfill(application)
 
-    logger.info("✅ Startup tasks complete, bot is ready!")
+    logger.info("✅ Startup complete!")
+    logger.info("💡 Use /scan <start_id> <end_id> to manually scan your topic's messages")
 
 
 def main():
