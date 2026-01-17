@@ -87,25 +87,28 @@ if not BOT_TOKEN:
 # CRASH-RESISTANT BACKFILL (RUNS ON EVERY STARTUP)
 # ============================================================================
 
-async def smart_backfill(application: Application):
+async def smart_backfill(application: Application, scan_range=None):
     """
-    Self-healing sync mechanism that runs on EVERY bot startup.
+    Self-healing sync mechanism with message ID range scanning.
 
     This function:
     1. Loads existing submissions.json (or creates if missing)
-    2. Fetches ALL messages from topic since campaign start
+    2. Scans through message IDs in the topic using forwarding probe
     3. Compares message_ids: existing vs. fetched
     4. Processes ONLY new message_ids (idempotent)
     5. Updates JSON atomically
     6. Sends sync notification to all admins
 
+    Args:
+        scan_range: Tuple of (start_id, end_id) for message scanning, or None for env config
+
     This ensures the bot recovers from:
     - Crashes
     - Railway redeployments
     - Extended downtime
-    - Data corruption (via backups)
+    - Historical message backfill
     """
-    logger.info("🔄 Starting smart backfill...")
+    logger.info("🔄 Starting smart backfill with message ID scanner...")
     start_time = time.time()
 
     # Load existing data
@@ -121,86 +124,158 @@ async def smart_backfill(application: Application):
 
     logger.info(f"📊 Found {existing_count} existing submissions in database")
 
-    # Fetch all messages from topic
-    all_messages = []
-    offset_id = 0
-    batch_count = 0
+    # Determine scan range
+    if scan_range:
+        start_id, end_id = scan_range
+    else:
+        # Get from environment variables or use defaults
+        start_id = int(os.getenv('SCAN_START_ID', TOPIC_ID))
+        # Default: scan 2000 messages ahead (should cover most topics)
+        scan_range_size = int(os.getenv('SCAN_RANGE', '2000'))
+        end_id = start_id + scan_range_size
 
-    try:
-        while True:
-            try:
-                # Fetch messages in batches of 100
-                logger.info(f"Fetching messages batch {batch_count + 1} (offset: {offset_id})...")
+    logger.info(f"📡 Scanning message IDs from {start_id} to {end_id}")
 
-                # Get chat to access forum topic messages
-                messages = await application.bot.get_updates(
-                    offset=offset_id,
-                    limit=100,
-                    timeout=30
+    # Collect processed messages
+    processed_messages = []
+    new_submissions = 0
+    skipped_messages = 0
+    errors = 0
+
+    # Get first admin ID for forwarding probe
+    probe_chat_id = ADMIN_IDS[0] if ADMIN_IDS else None
+
+    if not probe_chat_id:
+        logger.error("❌ No admin ID available for message scanning")
+        # Send notification about limitation
+        await send_sync_notification(application, {
+            'is_first_run': is_first_run,
+            'total_found': existing_count,
+            'existing_count': existing_count,
+            'new_count': 0,
+            'duration': time.time() - start_time,
+            'top_3': [],
+            'total_users': len(data['users']),
+            'date_range': 'Unable to scan - no admin configured',
+            'error': 'SCAN_DISABLED'
+        })
+        return
+
+    logger.info(f"🔍 Using message probe via admin chat {probe_chat_id}")
+
+    # Scan through message ID range
+    batch_size = 10  # Process in small batches
+    total_range = end_id - start_id
+
+    for msg_id in range(start_id, end_id):
+        # Progress logging every 50 messages
+        if (msg_id - start_id) % 50 == 0:
+            progress = ((msg_id - start_id) / total_range) * 100
+            logger.info(f"📊 Progress: {progress:.1f}% ({msg_id - start_id}/{total_range})")
+
+        # Skip if already processed
+        if msg_id in existing_message_ids:
+            skipped_messages += 1
+            continue
+
+        try:
+            # Probe: Try to forward message to get its info
+            # This is a workaround for Bot API's lack of direct message fetching
+            forwarded = await application.bot.forward_message(
+                chat_id=probe_chat_id,
+                from_chat_id=CHAT_ID,
+                message_id=msg_id
+            )
+
+            # Check if the forwarded message is from the correct topic and has photo
+            if forwarded.photo and forwarded.message_thread_id == TOPIC_ID:
+                # Get original message info from forward
+                original_user = forwarded.forward_from or forwarded.forward_sender_name
+
+                if not original_user:
+                    logger.debug(f"Message {msg_id} has no sender info, skipping")
+                    continue
+
+                # Extract user info
+                if hasattr(original_user, 'id'):
+                    user_id = original_user.id
+                    username = original_user.username or "Unknown"
+                    full_name = original_user.full_name or "Unknown"
+                else:
+                    # Anonymous forward or sender name only
+                    logger.debug(f"Message {msg_id} is anonymous, skipping")
+                    continue
+
+                # Get photo_id (largest size)
+                photo_id = forwarded.photo[-1].file_id
+
+                # Get timestamp (use forward date as approximation)
+                timestamp = forwarded.forward_date or forwarded.date
+
+                # Check if within campaign period
+                if timestamp < CAMPAIGN_START or timestamp > CAMPAIGN_END:
+                    logger.debug(f"Message {msg_id} outside campaign period")
+                    continue
+
+                # Calculate week number
+                week = calculate_week_number(timestamp)
+                if week is None:
+                    logger.warning(f"Could not calculate week for message {msg_id}")
+                    continue
+
+                # Add submission (idempotent)
+                added = add_submission(
+                    user_id=user_id,
+                    username=username,
+                    full_name=full_name,
+                    message_id=msg_id,
+                    photo_id=photo_id,
+                    timestamp=timestamp,
+                    week=week
                 )
 
-                # Alternative: Use iter_chat_messages if available
-                # For now, we'll use a different approach - getting messages from the topic
-                # Note: Telegram Bot API doesn't provide direct history access for topics
-                # We need to use getChatHistory which isn't in standard bot API
-                # Instead, we'll fetch by iterating through message IDs
+                if added:
+                    new_submissions += 1
+                    processed_messages.append(msg_id)
+                    logger.info(f"✅ Processed: msg={msg_id}, user={username}, week={week}")
 
-                # Since we can't get history directly, we'll need to track messages in real-time
-                # and catch up by checking a range of message IDs
+                # Delete the forwarded probe message to keep chat clean
+                try:
+                    await application.bot.delete_message(
+                        chat_id=probe_chat_id,
+                        message_id=forwarded.message_id
+                    )
+                except Exception:
+                    pass  # Ignore deletion errors
 
-                # WORKAROUND: Try to get messages by ID range
-                # Start from the first possible message in the topic
-                if offset_id == 0:
-                    # First topic message is TOPIC_ID, start from there
-                    offset_id = TOPIC_ID
+            # Rate limiting: small delay every batch
+            if (msg_id - start_id) % batch_size == 0:
+                await asyncio.sleep(0.5)  # 500ms delay every 10 messages
 
-                fetched_messages = []
-                batch_size = 100
+        except TelegramError as e:
+            # Message doesn't exist, not a photo, or other error
+            error_msg = str(e).lower()
+            if 'message to forward not found' in error_msg or 'message not found' in error_msg:
+                # Normal - message doesn't exist or was deleted
+                pass
+            elif 'message_thread_id_invalid' in error_msg:
+                # Message exists but not in a topic
+                pass
+            else:
+                errors += 1
+                if errors < 10:  # Only log first 10 errors to avoid spam
+                    logger.debug(f"Error probing message {msg_id}: {e}")
 
-                # Try to fetch messages by ID
-                for msg_id in range(offset_id, offset_id + batch_size):
-                    try:
-                        # Try to forward message to get its info (hacky but works)
-                        # Better approach: Use getUpdates or rely on real-time only
-                        # For backfill, we'll check messages that exist
+        except Exception as e:
+            logger.error(f"Unexpected error processing message {msg_id}: {e}")
+            errors += 1
 
-                        # Actually, let's use a different approach:
-                        # Check if message exists by trying to get it
-                        chat = await application.bot.get_chat(CHAT_ID)
-                        # This won't work either...
-
-                        # BEST APPROACH: Use application.bot.get_updates() isn't for message history
-                        # We need to note that Telegram Bot API has limitations
-
-                        # Let's break and note this limitation
-                        break
-
-                    except Exception as e:
-                        # Message doesn't exist or error
-                        continue
-
-                # Since we can't easily fetch history, we'll rely on:
-                # 1. Real-time message tracking going forward
-                # 2. Manual backfill using admin command if needed
-
-                # For now, log that we're starting fresh or using existing data
-                logger.warning("⚠️ Telegram Bot API doesn't support topic message history")
-                logger.info("📝 Bot will track messages in real-time from now on")
-                logger.info("💡 Use /backfill command if you need to manually sync specific messages")
-
-                break
-
-            except TelegramError as e:
-                logger.error(f"Error fetching messages: {e}")
-                await asyncio.sleep(5)  # Backoff on error
-                break
-
-    except Exception as e:
-        logger.error(f"Fatal error during backfill: {e}")
-
-    # Calculate stats
+    # Calculate final stats
     duration = time.time() - start_time
-    new_count = len(all_messages) - existing_count
+    total_found = existing_count + new_submissions
+
+    # Reload data to get updated user count
+    data = load_submissions()
 
     # Get top 3 for notification
     current_week = get_current_week()
@@ -213,16 +288,26 @@ async def smart_backfill(application: Application):
     # Prepare sync stats
     sync_stats = {
         'is_first_run': is_first_run,
-        'total_found': len(all_messages),
+        'total_found': total_found,
         'existing_count': existing_count,
-        'new_count': max(0, new_count),
+        'new_count': new_submissions,
         'duration': duration,
         'top_3': top_3,
         'total_users': len(data['users']),
-        'date_range': ''
+        'date_range': f"Scanned {start_id} to {end_id}"
     }
 
     # Send notifications to admins
+    await send_sync_notification(application, sync_stats)
+
+    logger.info(f"✅ Backfill complete in {duration:.1f}s")
+    logger.info(f"📊 Scanned: {end_id - start_id} message IDs")
+    logger.info(f"📊 Results: {existing_count} existing + {new_submissions} new = {total_found} total submissions")
+    logger.info(f"📊 Errors: {errors}")
+
+
+async def send_sync_notification(application: Application, sync_stats: dict):
+    """Helper function to send sync notifications to all admins"""
     notification = format_sync_notification(sync_stats)
 
     for admin_id in ADMIN_IDS:
@@ -234,9 +319,6 @@ async def smart_backfill(application: Application):
             logger.info(f"✅ Sent sync notification to admin {admin_id}")
         except Exception as e:
             logger.error(f"Failed to notify admin {admin_id}: {e}")
-
-    logger.info(f"✅ Backfill complete in {duration:.1f}s")
-    logger.info(f"📊 Database: {existing_count} existing + {max(0, new_count)} new = {len(all_messages)} total")
 
 
 # ============================================================================
@@ -505,15 +587,59 @@ async def cmd_winners(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @dm_only
 async def cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /backfill command - Manually trigger backfill
+    /backfill command - Manually trigger backfill with default range
     Admin only, DM only
     """
-    await update.message.reply_text("🔄 Starting manual backfill...")
+    await update.message.reply_text("🔄 Starting manual backfill with default range...")
 
     # Run backfill
     await smart_backfill(context.application)
 
-    await update.message.reply_text("✅ Backfill complete!")
+    await update.message.reply_text("✅ Backfill complete! Check results above.")
+
+
+@admin_only
+@dm_only
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /scan <start_id> <end_id> command - Scan specific message ID range
+    Admin only, DM only
+
+    Example: /scan 103380 103580
+    """
+    # Parse arguments
+    if not context.args or len(context.args) != 2:
+        await update.message.reply_text(
+            "Usage: /scan <start_id> <end_id>\n\n"
+            "Example: /scan 103380 103580\n\n"
+            "This will scan message IDs from 103380 to 103580 in the campaign topic."
+        )
+        return
+
+    try:
+        start_id = int(context.args[0])
+        end_id = int(context.args[1])
+
+        if start_id >= end_id:
+            raise ValueError("Start ID must be less than end ID")
+
+        if end_id - start_id > 5000:
+            raise ValueError("Range too large (max 5000 messages)")
+
+    except ValueError as e:
+        await update.message.reply_text(f"❌ Invalid range: {e}")
+        return
+
+    await update.message.reply_text(
+        f"🔄 Starting scan of {end_id - start_id} message IDs...\n"
+        f"📡 Range: {start_id} to {end_id}\n\n"
+        f"⏳ This may take a few minutes. You'll receive probe messages briefly as the scan runs."
+    )
+
+    # Run backfill with custom range
+    await smart_backfill(context.application, scan_range=(start_id, end_id))
+
+    await update.message.reply_text("✅ Scan complete! Check results above.")
 
 
 @admin_only
@@ -589,6 +715,7 @@ def main():
     application.add_handler(CommandHandler('selectwinners', cmd_selectwinners))
     application.add_handler(CommandHandler('winners', cmd_winners))
     application.add_handler(CommandHandler('backfill', cmd_backfill))
+    application.add_handler(CommandHandler('scan', cmd_scan))
     application.add_handler(CommandHandler('stats', cmd_stats))
 
     # Start bot

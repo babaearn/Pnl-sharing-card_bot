@@ -75,6 +75,36 @@ pnl-leaderboard-bot/
    - You should receive a DM from the bot with sync notification
    - Test with `/pnlrank` command in the Telegram topic
 
+5. **⭐ Scan Historical Messages (If Needed)**
+
+   If there are already submissions in the topic before the bot joined:
+
+   a. **Find your topic's message ID range**:
+      - In Telegram Web/Desktop, right-click any message in the topic
+      - Click "Copy Link" - you'll get something like: `https://t.me/c/1868775086/103450`
+      - The last number (103450) is a message ID
+      - Find the first and latest message IDs in your topic
+
+   b. **Run the scan command** (DM the bot):
+      ```
+      /scan 103380 103600
+      ```
+      Replace with your actual message ID range. For 180 messages, you'll need approximately 200-300 ID range.
+
+   c. **Wait for completion**:
+      - Bot will send progress updates
+      - You'll briefly see forwarded messages (auto-deleted)
+      - You'll receive a final summary with:
+        - Number of submissions found
+        - New vs already processed
+        - Updated leaderboard
+
+   d. **Verify results**:
+      ```
+      /pnlrank
+      ```
+      Should now show the correct rankings with historical data!
+
 ## 📱 Campaign Configuration
 
 ```python
@@ -147,7 +177,28 @@ View previously selected winners for a specific week.
 **Example**: `/winners 1`
 
 #### `/backfill`
-Manually trigger the backfill/sync process (normally runs automatically on startup).
+Manually trigger the backfill/sync process with default scan range (2000 messages from TOPIC_ID).
+
+#### `/scan <start_id> <end_id>`
+**⭐ NEW - For Historical Message Scanning**
+
+Scan a specific range of message IDs to process historical submissions.
+
+**Example**: `/scan 103380 103580`
+
+This command:
+- Scans through message IDs from start to end
+- Processes only photo messages in the campaign topic
+- Skips already-processed messages (idempotent)
+- Works by forwarding messages briefly to your DM (auto-deleted)
+- Can scan up to 5000 messages per command
+
+**For 180 historical messages**: If your topic started at message 103380, try:
+```
+/scan 103380 103600
+```
+
+Adjust the end ID based on your topic's message range.
 
 #### `/stats`
 Show campaign statistics including total participants and submissions.
