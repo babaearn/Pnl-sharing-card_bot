@@ -187,8 +187,39 @@ async def smart_backfill(application: Application, scan_range=None):
                 message_id=msg_id
             )
 
-            # Check if the forwarded message is from the correct topic and has photo
-            if forwarded.photo and forwarded.message_thread_id == TOPIC_ID:
+            # IMPORTANT: Check if message has photos first
+            if not forwarded.photo:
+                # Not a photo, delete and skip
+                try:
+                    await application.bot.delete_message(
+                        chat_id=probe_chat_id,
+                        message_id=forwarded.message_id
+                    )
+                except Exception:
+                    pass
+                continue
+
+            # Check if forwarded message is from the correct chat
+            # When forwarding from topics, forward_from_chat will be the supergroup
+            # and forward_from_message_id will be the original message ID
+            if not forwarded.forward_from_chat or forwarded.forward_from_chat.id != CHAT_ID:
+                # Not from our target chat, delete and skip
+                try:
+                    await application.bot.delete_message(
+                        chat_id=probe_chat_id,
+                        message_id=forwarded.message_id
+                    )
+                except Exception:
+                    pass
+                logger.debug(f"Message {msg_id} not from target chat, skipping")
+                continue
+
+            # Since we can't reliably check topic ID from forwarded messages,
+            # we'll rely on the message ID range being within the topic
+            # and the campaign date filter to ensure correctness
+            # The user should provide a tight message ID range for their specific topic
+
+            if forwarded.photo:
                 # Get original message info from forward
                 original_user = forwarded.forward_from or forwarded.forward_sender_name
 
@@ -610,9 +641,15 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Parse arguments
     if not context.args or len(context.args) != 2:
         await update.message.reply_text(
-            "Usage: /scan <start_id> <end_id>\n\n"
+            "📡 Usage: /scan <start_id> <end_id>\n\n"
             "Example: /scan 103380 103580\n\n"
-            "This will scan message IDs from 103380 to 103580 in the campaign topic."
+            "⚠️ IMPORTANT:\n"
+            "• Only scan messages from YOUR topic\n"
+            "• Find start ID: Right-click FIRST message in topic → Copy Link\n"
+            "• Find end ID: Right-click LATEST message in topic → Copy Link\n"
+            "• Use a tight range to avoid other topics!\n\n"
+            f"💡 Your topic ID is: {TOPIC_ID}\n"
+            f"Usually starts around: {TOPIC_ID} (topic creation message)"
         )
         return
 
@@ -633,7 +670,12 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🔄 Starting scan of {end_id - start_id} message IDs...\n"
         f"📡 Range: {start_id} to {end_id}\n\n"
-        f"⏳ This may take a few minutes. You'll receive probe messages briefly as the scan runs."
+        f"⚠️ Make sure this range ONLY contains messages from topic {TOPIC_ID}\n"
+        f"⏳ This may take a few minutes. You'll see probe messages briefly (auto-deleted).\n\n"
+        f"📊 Filter criteria:\n"
+        f"✅ Photos only\n"
+        f"✅ Campaign dates: Jan 15 - Feb 11, 2025\n"
+        f"✅ From your group chat"
     )
 
     # Run backfill with custom range
@@ -671,10 +713,12 @@ async def post_init(application: Application):
     """Run after bot initialization, before start"""
     logger.info("🤖 Bot initialized, running startup tasks...")
 
-    # Run smart backfill on every startup
-    await smart_backfill(application)
+    # DISABLED: Automatic backfill on startup (prevents scanning wrong topics)
+    # Use /scan command manually with correct message ID range for your specific topic
+    # await smart_backfill(application)
 
-    logger.info("✅ Startup tasks complete, bot is ready!")
+    logger.info("✅ Startup complete!")
+    logger.info("💡 Use /scan <start_id> <end_id> to manually scan your topic's messages")
 
 
 def main():
