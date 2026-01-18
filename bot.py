@@ -455,7 +455,12 @@ async def handle_forwarded_message(update: Update, context: ContextTypes.DEFAULT
 
     # Only admins can use this feature
     if not is_admin(message.from_user.id):
-        logger.debug(f"User {message.from_user.id} is not admin, skipping")
+        await message.reply_text(
+            "⚠️ Admin access required\n\n"
+            "Only admins can use the manual forwarding feature.\n"
+            f"Your ID: {message.from_user.id}\n\n"
+            "Please contact the bot administrator."
+        )
         return
 
     # Must be a forwarded message
@@ -465,23 +470,53 @@ async def handle_forwarded_message(update: Update, context: ContextTypes.DEFAULT
 
     # Must have a photo
     if not message.photo:
-        logger.debug("No photo in message, skipping")
+        await message.reply_text(
+            "⚠️ No photo detected\n\n"
+            "Please forward a message that contains a photo."
+        )
         return
 
     logger.info(f"✅ Processing forwarded PnL card from admin {message.from_user.id}")
+    logger.info(f"   Forward metadata: from_user={bool(message.forward_from)}, from_chat={bool(message.forward_from_chat)}, sender_name={message.forward_sender_name}")
 
     # Extract original user info
     if message.forward_from:
-        # Full user object available
+        # Full user object available (forwarded from user's DM)
         original_user_id = message.forward_from.id
         original_username = message.forward_from.username or "Unknown"
         original_full_name = message.forward_from.full_name or "Unknown"
-    else:
-        # Privacy settings hide user, only name available
+        logger.info(f"   ✅ Got user from forward_from: {original_username} ({original_user_id})")
+    elif message.forward_from_chat:
+        # Forwarded from a channel/group/topic - can't determine original user
         await message.reply_text(
-            "⚠️ Cannot count this PnL card\n\n"
-            "The original sender has privacy settings enabled that hide their user info.\n"
-            "They need to allow forwarding with user info, or post directly in the topic."
+            "❌ Cannot count PnL cards forwarded from topics/channels\n\n"
+            "When you forward from a topic, Telegram doesn't preserve the original user info.\n\n"
+            "✅ SOLUTION: Use /scan command instead:\n"
+            "1. Go to PnL Flex Challenge topic\n"
+            "2. Right-click FIRST PnL card → Copy Link → Get message ID\n"
+            "3. Right-click LAST PnL card → Copy Link → Get message ID\n"
+            "4. Run: /scan <first_id> <last_id>\n\n"
+            f"📋 This message was forwarded from: {message.forward_from_chat.title or message.forward_from_chat.username or 'Unknown'}\n"
+            f"📋 Forward from chat ID: {message.forward_from_chat.id}"
+        )
+        return
+    elif message.forward_sender_name:
+        # User has privacy settings, only name available
+        await message.reply_text(
+            f"⚠️ Cannot count this PnL card\n\n"
+            f"The original sender '{message.forward_sender_name}' has privacy settings enabled.\n\n"
+            f"They need to:\n"
+            f"• Go to Telegram Settings → Privacy and Security\n"
+            f"• Disable 'Link account when forwarding'\n\n"
+            f"OR post the PnL card directly in topic {TOPIC_ID} for automatic counting."
+        )
+        return
+    else:
+        # No forward info at all
+        await message.reply_text(
+            "⚠️ Cannot determine original sender\n\n"
+            "This forwarded message has no sender information.\n\n"
+            "Please use /scan command to count messages from the topic instead."
         )
         return
 
