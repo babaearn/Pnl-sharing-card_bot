@@ -43,12 +43,14 @@ from utils import (
 from data_manager import (
     add_submission,
     load_submissions,
+    save_submissions,
     save_config,
     load_config,
     get_leaderboard,
     save_week_winners,
     get_week_winners,
-    get_stats
+    get_stats,
+    DATA_DIR
 )
 from leaderboard import (
     format_leaderboard,
@@ -837,7 +839,11 @@ async def cmd_checkmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         # Try to forward the message to probe it
-        probe_chat_id = ADMIN_IDS[0]
+        probe_chat_id = ADMIN_IDS[0] if ADMIN_IDS else None
+
+        if not probe_chat_id:
+            await update.message.reply_text("❌ No admin configured for message probing")
+            return
 
         forwarded = await context.bot.forward_message(
             chat_id=probe_chat_id,
@@ -889,8 +895,6 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /debug command - Show debug information
     Admin only - helps diagnose issues
     """
-    from datetime import datetime
-
     now = datetime.now(IST)
 
     # Get current leaderboard stats
@@ -979,13 +983,11 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = load_submissions()
 
         # Create backup timestamp
-        from datetime import datetime
         backup_time = datetime.now(IST).strftime('%Y%m%d_%H%M%S')
 
-        # Save backup with timestamp
+        # Save backup with timestamp using DATA_DIR
         import json
-        from pathlib import Path
-        backup_file = Path(f"/app/data/submissions_reset_backup_{backup_time}.json")
+        backup_file = DATA_DIR / f"submissions_reset_backup_{backup_time}.json"
         with open(backup_file, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
@@ -1010,7 +1012,6 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data['stats']['last_updated'] = format_timestamp(datetime.now(IST))
 
         # Save atomically
-        from data_manager import save_submissions
         save_submissions(data)
 
         await update.message.reply_text(
