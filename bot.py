@@ -836,6 +836,28 @@ def main():
     logger.info(f"📍 Monitoring Chat: {CHAT_ID}, Topic: {TOPIC_ID}")
     logger.info(f"👨‍💼 Admins: {ADMIN_IDS}")
 
+    # Startup sanity check: verify files are present
+    try:
+        import os as sanity_os
+        cwd = sanity_os.getcwd()
+        logger.info(f"📂 Current working directory: {cwd}")
+
+        app_files = sanity_os.listdir('/app')
+        logger.info(f"📋 Files in /app: {sorted(app_files)}")
+
+        # Verify critical files
+        if 'db.py' not in app_files:
+            logger.error("❌ CRITICAL: db.py not found in /app directory!")
+        else:
+            logger.info("✅ db.py found in /app directory")
+
+        if 'bot.py' not in app_files:
+            logger.error("❌ CRITICAL: bot.py not found in /app directory!")
+        else:
+            logger.info("✅ bot.py found in /app directory")
+    except Exception as e:
+        logger.error(f"⚠️ Startup sanity check failed: {e}")
+
     # Create application
     application = (
         Application.builder()
