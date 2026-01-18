@@ -443,23 +443,30 @@ async def handle_forwarded_message(update: Update, context: ContextTypes.DEFAULT
     """
     message = update.message
 
+    # Debug logging
+    logger.info(f"📨 Photo received in DM from user {message.from_user.id}, forwarded={bool(message.forward_date)}")
+
     # Only work in private chats (DMs)
     if message.chat.type != 'private':
+        logger.debug("Not a private chat, skipping")
         return
 
     # Only admins can use this feature
     if not is_admin(message.from_user.id):
+        logger.debug(f"User {message.from_user.id} is not admin, skipping")
         return
 
     # Must be a forwarded message
-    if not message.forward_from and not message.forward_sender_name:
+    if not message.forward_date:
+        logger.debug("Not a forwarded message (no forward_date), skipping")
         return
 
     # Must have a photo
     if not message.photo:
+        logger.debug("No photo in message, skipping")
         return
 
-    logger.info(f"📨 Forwarded PnL card received from admin {message.from_user.id}")
+    logger.info(f"✅ Processing forwarded PnL card from admin {message.from_user.id}")
 
     # Extract original user info
     if message.forward_from:
@@ -524,6 +531,8 @@ async def cmd_pnlrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /pnlrank command - Show all-time Top 5 leaderboard
     Case-insensitive, works in group or DM
     TIME-INDEPENDENT: Shows cumulative all-time rankings
+
+    Auto-deletes after 60 seconds to keep chat clean.
     """
     # Get config for point visibility
     config = load_config()
@@ -535,7 +544,29 @@ async def cmd_pnlrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         limit=5
     )
 
-    await update.message.reply_text(leaderboard_text)
+    # Send leaderboard message
+    sent_message = await update.message.reply_text(leaderboard_text)
+
+    # Auto-delete after 60 seconds
+    async def delete_after_delay():
+        await asyncio.sleep(60)
+        try:
+            # Delete the leaderboard response
+            await context.bot.delete_message(
+                chat_id=sent_message.chat_id,
+                message_id=sent_message.message_id
+            )
+            # Also try to delete the command message
+            await context.bot.delete_message(
+                chat_id=update.message.chat_id,
+                message_id=update.message.message_id
+            )
+            logger.info(f"Auto-deleted /pnlrank messages after 60s")
+        except Exception as e:
+            logger.debug(f"Could not delete /pnlrank messages: {e}")
+
+    # Run deletion in background
+    asyncio.create_task(delete_after_delay())
 
 
 # ============================================================================
@@ -741,9 +772,15 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"⚠️ WARNING: You're in topic {command_topic_id}\n"
             f"Expected: {TOPIC_ID} (PnL Flex Challenge)\n\n"
-            f"This scan will look for messages from topic {TOPIC_ID}, "
-            f"but you should run this command IN that topic for better accuracy!"
+            f"⚠️ IMPORTANT: Message IDs are shared across ALL topics!\n"
+            f"Scanning IDs {start_id}-{end_id} will check messages from ALL topics, not just {TOPIC_ID}.\n\n"
+            f"To avoid counting wrong messages:\n"
+            f"1. Go to PnL Flex Challenge topic\n"
+            f"2. Right-click FIRST PnL card → Copy Link → Get message ID\n"
+            f"3. Right-click LAST PnL card → Copy Link → Get message ID\n"
+            f"4. Use those exact IDs: /scan <first_id> <last_id>"
         )
+        return  # Don't proceed if in wrong topic
 
     status_msg = (
         f"🔄 Starting scan of {end_id - start_id} message IDs...\n"
@@ -1052,25 +1089,36 @@ async def cmd_scantopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     # Auto-determine message ID range
-    # Strategy: Use the current message ID as a reference point
-    # Scan backwards and forwards from topic start
+    # IMPORTANT: Message IDs are sequential across the ENTIRE supergroup, not per-topic!
+    # This means scanning a large range will include messages from OTHER topics too.
+    # Strategy: Scan a tight range around the current message position
     current_msg_id = message.message_id
 
-    # For most topics, scan from topic_id (first message) to current message + buffer
-    # This assumes topic_id is close to the first message ID in the topic
-    start_id = topic_id  # Topic ID is usually close to first message
-    end_id = current_msg_id + 1000  # Scan ahead for future messages
+    # Scan last 2000 messages before current position + 500 ahead for future messages
+    # This tight range reduces (but doesn't eliminate) cross-topic contamination
+    start_id = max(topic_id, current_msg_id - 2000)  # Don't go before topic creation
+    end_id = current_msg_id + 500  # Small buffer for future messages
 
     scan_range = end_id - start_id
 
-    if scan_range > 5000:
-        await message.reply_text(
-            f"⚠️ Auto-detected range too large ({scan_range} messages)\n\n"
-            f"Please use /scan command with specific IDs instead:\n"
-            f"/scan {start_id} {start_id + 5000}\n\n"
-            f"Or find precise message IDs by right-clicking PnL cards."
-        )
-        return
+    # Warn about limitation
+    warning_msg = (
+        f"⚠️ IMPORTANT LIMITATION ⚠️\n\n"
+        f"Telegram doesn't expose topic IDs in message metadata, so this scan "
+        f"will process ALL messages in the chat with IDs {start_id}-{end_id}, "
+        f"including messages from OTHER topics!\n\n"
+        f"📌 For accurate results:\n"
+        f"• Right-click FIRST PnL card → Copy Link → Note message ID\n"
+        f"• Right-click LAST PnL card → Copy Link → Note message ID\n"
+        f"• Use /scan <first_id> <last_id> for precise scanning\n\n"
+        f"Or forward individual PnL cards to bot DM for manual counting.\n\n"
+        f"Continue with auto-scan anyway?"
+    )
+
+    await message.reply_text(warning_msg)
+
+    # Give user 5 seconds to read the warning
+    await asyncio.sleep(5)
 
     await message.reply_text(
         f"🔄 Auto-scanning topic {topic_id}\n\n"
@@ -1131,9 +1179,10 @@ def main():
     )
 
     # Add forwarded message handler (manual counting in DM)
+    # Check for forwarded messages manually since filters.FORWARDED may not exist in all versions
     application.add_handler(
         MessageHandler(
-            filters.PHOTO & filters.ChatType.PRIVATE & filters.FORWARDED,
+            filters.PHOTO & filters.ChatType.PRIVATE,
             handle_forwarded_message
         )
     )
