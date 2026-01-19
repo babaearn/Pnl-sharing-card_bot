@@ -421,6 +421,26 @@ async def handle_forwarded_dm(update: Update, context: ContextTypes.DEFAULT_TYPE
 # PUBLIC COMMANDS
 # ============================================================================
 
+def format_leaderboard_entry(entry: Dict, show_points: bool) -> str:
+    """
+    Format a single leaderboard entry for public display.
+
+    Args:
+        entry: Dict with 'display_name' and 'points' keys
+        show_points: Whether to display points
+
+    Returns:
+        Formatted string like "🏅 John Doe - 45 pts" or "🏅 John Doe"
+    """
+    name = entry.get('display_name') or "Unknown"
+
+    if show_points:
+        points = entry.get('points', 0)
+        return f"🏅 {name} - {points} pts"
+    else:
+        return f"🏅 {name}"
+
+
 async def cmd_pnlrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /pnlrank - Show Top 5 leaderboard (case-insensitive).
@@ -440,16 +460,8 @@ async def cmd_pnlrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Format leaderboard
     lines = ["🏆 PnL Flex Challenge - Top 5\n"]
 
-    for idx, entry in enumerate(leaderboard, 1):
-        emoji = {1: '🥇', 2: '🥈', 3: '🥉'}.get(idx, f'{idx}.')
-        code = entry['code']
-        name = entry['display_name']
-        points = entry['points']
-
-        if show_points:
-            lines.append(f"{emoji} {code} {name} - {points} pts")
-        else:
-            lines.append(f"{emoji} {code} {name}")
+    for entry in leaderboard:
+        lines.append(format_leaderboard_entry(entry, show_points))
 
     text = "\n".join(lines)
 
