@@ -1,37 +1,45 @@
-# PnL Flex Challenge Leaderboard Bot 🏆
+# PnL Flex Challenge Leaderboard Bot 🏆 (PostgreSQL Edition)
 
-Production-ready Telegram bot for tracking PnL Share Card submissions with crash-resistant architecture and automatic sync on every restart.
+Production-ready Telegram bot for tracking PnL Share Card submissions using **PostgreSQL** as the source of truth. Features batch forwarding system, participant codes, and crash-resistant architecture.
 
 ## 🌟 Key Features
 
-- **Crash-Resistant Architecture**: Automatic sync on every restart (crashes, redeployments, downtime)
-- **Idempotent Processing**: Uses `message_id` as primary key to prevent duplicate counting
-- **Duplicate Photo Detection**: Tracks `photo_id` to prevent same image from being counted twice
-- **Atomic JSON Writes**: Prevents data corruption with automatic backups
-- **Admin Notifications**: DM alerts after each sync with statistics
-- **Weekly Tracking**: 4-week campaign with individual weekly leaderboards
-- **Configurable Points Display**: Toggle points visibility in public leaderboard
-- **Token Masking**: Sensitive data automatically masked in logs
+- **PostgreSQL Database**: Reliable, scalable persistence with proper transactions
+- **Batch Forwarding**: Forward ~180 photos at once with progress tracking
+- **Participant Codes**: Auto-assigned #01, #02, etc. for easy reference
+- **Identity System**: Tracks users by Telegram ID or normalized name
+- **forward_origin Support**: Uses Bot API 7.0+ for proper forward handling
+- **Idempotent Processing**: Duplicate protection via UNIQUE constraints
+- **Manual Adjustments**: Add/remove points with audit trail
+- **Time-Independent**: No campaign date filtering
+- **Auto-Delete Leaderboard**: Public /pnlrank cleans up after 60s
 
 ## 📁 Project Structure
 
 ```
 pnl-leaderboard-bot/
-├── bot.py                      # Main bot logic with smart_backfill
-├── data_manager.py             # Atomic JSON operations
-├── leaderboard.py              # Ranking and display formatting
-├── utils.py                    # Helper functions (week calc, admin checks)
-├── requirements.txt            # Python dependencies
-├── Dockerfile                  # Railway deployment configuration
-├── .dockerignore              # Docker build exclusions
-└── data/                       # Created at runtime
-    ├── submissions.json        # User submissions and points
-    ├── submissions.json.backup # Auto-backup
-    ├── winners.json            # Weekly winners (Top 5)
-    ├── winners.json.backup     # Auto-backup
-    ├── config.json             # Bot configuration
-    └── config.json.backup      # Auto-backup
+├── bot.py                 # Main bot logic with PostgreSQL
+├── db.py                  # Database layer (asyncpg)
+├── utils.py               # Helper functions
+├── requirements.txt       # Python dependencies (includes asyncpg)
+├── Dockerfile             # Railway deployment
+└── .dockerignore         # Docker build exclusions
 ```
+
+## 🗄️ Database Schema
+
+### Tables
+
+- **participants**: Users with codes (#01, #02...), points, identity keys
+- **submissions**: Photo submissions (unique per participant+photo)
+- **adjustments**: Manual point changes with audit trail
+- **settings**: Key-value config store
+- **winners**: Weekly Top 5 snapshots
+
+### Identity Keys
+
+- Telegram ID available: `tg:<user_id>` (best case)
+- No Telegram ID: `name:<normalized_display_name>` (fallback)
 
 ## 🚀 Railway Deployment
 
@@ -43,337 +51,417 @@ pnl-leaderboard-bot/
 
 ### Deployment Steps
 
-1. **Create New Railway Project**
-   - Go to [railway.app](https://railway.app)
-   - Click "New Project" → "Deploy from GitHub repo"
-   - Select your repository
+#### 1. Create Railway Project
 
-2. **Set Environment Variables**
+- Go to [railway.app](https://railway.app)
+- Click "New Project" → "Deploy from GitHub repo"
+- Select your repository
 
-   Go to your Railway project → Variables → Add the following:
+#### 2. Add PostgreSQL Plugin
 
-   ```env
-   BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
-   ADMIN_IDS=1064156047,987654321,123456789
-   CHAT_ID=-1001868775086
-   TOPIC_ID=103380
-   TIMEZONE=Asia/Kolkata
-   ```
+**CRITICAL**: You must add PostgreSQL database:
 
-   **Important**:
-   - Replace `BOT_TOKEN` with your actual bot token
-   - Replace `ADMIN_IDS` with comma-separated admin user IDs (no spaces)
-   - `CHAT_ID` and `TOPIC_ID` are pre-configured for the campaign
+1. Click on your project
+2. Click "+ New" → "Database" → "Add PostgreSQL"
+3. Railway will create a Postgres instance and set `DATABASE_URL`
 
-3. **Deploy**
-   - Railway will automatically detect the Dockerfile
-   - Click "Deploy"
-   - Wait for deployment to complete
+#### 3. Set Environment Variables
 
-4. **Verify Deployment**
-   - Check Railway logs for: `🤖 Bot initialized, running startup tasks...`
-   - You should receive a DM from the bot with sync notification
-   - Test with `/pnlrank` command in the Telegram topic
+Go to your Railway project → Variables → Add:
 
-5. **⭐ Scan Historical Messages (If Needed)**
+```env
+BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
+ADMIN_IDS=1064156047,987654321
+CHAT_ID=-1001868775086
+TOPIC_ID=103380
+TZ=Asia/Kolkata
+```
 
-   If there are already submissions in the topic before the bot joined:
+**Important:**
+- `DATABASE_URL` is automatically set by PostgreSQL plugin
+- Replace `BOT_TOKEN` with your actual token
+- Replace `ADMIN_IDS` with comma-separated admin user IDs (no spaces)
+- `TZ` is optional (only affects logs, not logic)
 
-   a. **Find your topic's message ID range**:
-      - In Telegram Web/Desktop, right-click any message in the topic
-      - Click "Copy Link" - you'll get something like: `https://t.me/c/1868775086/103450`
-      - The last number (103450) is a message ID
-      - Find the first and latest message IDs in your topic
+#### 4. Add Variable Reference (Required!)
 
-   b. **Run the scan command** (DM the bot):
-      ```
-      /scan 103380 103600
-      ```
-      Replace with your actual message ID range. For 180 messages, you'll need approximately 200-300 ID range.
+The bot service needs access to PostgreSQL's `DATABASE_URL`:
 
-   c. **Wait for completion**:
-      - Bot will send progress updates
-      - You'll briefly see forwarded messages (auto-deleted)
-      - You'll receive a final summary with:
-        - Number of submissions found
-        - New vs already processed
-        - Updated leaderboard
+1. Go to bot service → Variables
+2. Click "+ New Variable" → "Reference"
+3. Select: PostgreSQL service → `DATABASE_URL`
+4. Click "Add"
 
-   d. **Verify results**:
-      ```
-      /pnlrank
-      ```
-      Should now show the correct rankings with historical data!
+**Without this step, the bot cannot connect to PostgreSQL!**
+
+#### 5. Deploy
+
+- Railway will automatically detect Dockerfile
+- Click "Deploy"
+- Watch deployment logs
+- Bot will create all tables automatically on first run
+
+#### 6. Verify Deployment
+
+Check Railway logs for:
+```
+✅ Database connection pool created
+✅ All tables created/verified
+✅ Bot ready!
+```
 
 ## 📱 Campaign Configuration
 
 ```python
 CHAT_ID = -1001868775086          # Campaign group chat
 TOPIC_ID = 103380                  # PnL Flex Challenge topic
-CAMPAIGN_START = 2025-01-15 00:01:00 IST
-CAMPAIGN_END = 2025-02-11 23:59:59 IST
-DURATION = 28 days (4 weeks)
-WEEKLY_REWARD = $5 USDT per winner (Top 5)
 ```
 
-### Week Breakdown
-
-- **Week 1**: Jan 15 - Jan 21
-- **Week 2**: Jan 22 - Jan 28
-- **Week 3**: Jan 29 - Feb 4
-- **Week 4**: Feb 5 - Feb 11
+No campaign dates - bot counts all photos regardless of time!
 
 ## 🎯 Commands
 
-### Public Commands (Available to Everyone)
+### Public Commands
 
-#### `/pnlrank`
-Shows Top 5 leaderboard for current week. Case-insensitive (`/PNLRank`, `/PNLRANK`, `/pnlRank` all work).
+#### `/pnlrank` (case-insensitive)
+
+Shows Top 5 leaderboard. Works in group or DM.
+
+**Auto-delete**: Bot response disappears after 60 seconds (user command stays).
 
 **Example output (points ON)**:
 ```
-🏆 PnL Flex Challenge - Week 1
+🏆 PnL Flex Challenge - Top 5
 
-🥇 @rohith950 - 45 points
-🥈 @crypto_king - 38 points
-🥉 @trader_pro - 32 points
-🏅 @moon_boy - 28 points
-🏅 @hodler - 25 points
+🥇 #01 @rohith950 - 45 pts
+🥈 #02 @crypto_king - 38 pts
+🥉 #03 @trader_pro - 32 pts
+4. #04 @moon_boy - 28 pts
+5. #05 @hodler - 25 pts
 ```
 
 **Example output (points OFF)**:
 ```
-🏆 PnL Flex Challenge - Week 1
+🏆 PnL Flex Challenge - Top 5
 
-🥇 @rohith950
-🥈 @crypto_king
-🥉 @trader_pro
-🏅 @moon_boy
-🏅 @hodler
+🥇 #01 @rohith950
+🥈 #02 @crypto_king
+🥉 #03 @trader_pro
+4. #04 @moon_boy
+5. #05 @hodler
 ```
 
 ### Admin Commands (DM Only)
 
-#### `/adminboard`
-Shows detailed Top 10 with user IDs and configuration status.
+#### `/rankerinfo`
 
-#### `/eng`
-Displays engagement statistics including total participants, submissions, most active users, and averages.
-
-#### `/pointson`
-Enable points display in public `/pnlrank` command.
-
-#### `/pointsoff`
-Disable points display in public `/pnlrank` command (ranks only).
-
-#### `/selectwinners <week>`
-Automatically select and save Top 5 winners for specified week.
-
-**Example**: `/selectwinners 1`
-
-#### `/winners <week>`
-View previously selected winners for a specific week.
-
-**Example**: `/winners 1`
-
-#### `/backfill`
-Manually trigger the backfill/sync process with default scan range (2000 messages from TOPIC_ID).
-
-#### `/scan <start_id> <end_id>`
-**⭐ NEW - For Historical Message Scanning**
-
-Scan a specific range of message IDs to process historical submissions.
-
-**Example**: `/scan 103380 103580`
-
-This command:
-- Scans through message IDs from start to end
-- Processes only photo messages in the campaign topic
-- Skips already-processed messages (idempotent)
-- Works by forwarding messages briefly to your DM (auto-deleted)
-- Can scan up to 5000 messages per command
-
-**For 180 historical messages**: If your topic started at message 103380, try:
+Shows Top 10 with full verification details:
 ```
-/scan 103380 103600
+#01 | @username | 1064156047 | 45 pts
+#02 | John Doe | Unknown | 38 pts
+...
 ```
 
-Adjust the end ID based on your topic's message range.
+Useful for verifying Telegram IDs and checking participant status.
+
+#### `/add #01 5`
+
+Manually adjust points:
+- Positive delta: `/add #01 5` (add 5 points)
+- Negative delta: `/add #01 -3` (remove 3 points)
+
+Creates audit record in `adjustments` table.
 
 #### `/stats`
-Show campaign statistics including total participants and submissions.
+
+Shows engagement statistics since last reset:
+- Total participants
+- Total submissions
+- Duplicates ignored
+- Manual adjustments
+- Most active participant
+- Average points per user
+- Last reset timestamp
+
+#### `/reset`
+
+**DANGEROUS**: Clears all data and restarts codes from #01.
+
+Two-step confirmation:
+1. `/reset` → Shows warning with current stats
+2. `/reset CONFIRM` → Actually performs reset
+
+Creates backup export before reset (optional).
+
+#### `/pointson` / `/pointsoff`
+
+Toggle points display in public `/pnlrank` command.
+
+#### `/selectwinners <week>`
+
+Save current Top 5 as weekly winners:
+```
+/selectwinners 1
+```
+
+Stores snapshot in `winners` table.
+
+#### `/winners <week>`
+
+View previously saved winners:
+```
+/winners 1
+```
+
+Shows Top 5 from that week with points at time of selection.
+
+#### `/help`
+
+Shows admin command reference.
+
+#### `/test`
+
+Runs health check:
+```
+✅ BOT HEALTH REPORT (/test)
+
+🔐 Admin: OK
+⚙️ Config: OK (CHAT_ID=-1001868775086, TOPIC_ID=103380)
+🗄️ Database: Connected
+  • Tables: OK
+  • Leaderboard query: OK
+  • Next code: #05
+📦 Batch Worker: OK (initialized)
+🧹 Auto Delete: Enabled (60s)
+
+✅ Overall: HEALTHY
+```
+
+#### `/testdata`
+
+Tests database transactions with rollback:
+```
+✅ TRANSACTION TEST PASSED
+
+• Insert participant: OK
+• Insert submission: OK
+• Select data: OK
+• Rollback: OK
+• Time: 23.45ms
+```
+
+## 🔄 Batch Forwarding Workflow
+
+**Best way to count historical PnL cards!**
+
+### How It Works
+
+1. **Go to PnL Flex Challenge topic**
+2. **Select ~180 PnL card photos**
+3. **Forward all at once to bot DM**
+4. **Bot shows progress** (updates every 10 items):
+   ```
+   ⏳ Processing forwarded media...
+
+   📨 Received: 45
+   ✅ Points added: 40
+   ⏭️ Duplicates: 3
+   ❌ Failed: 2
+   ```
+
+5. **After 12 seconds of no new forwards**, bot sends summary:
+   ```
+   ✅ Batch processing complete!
+
+   📊 Summary:
+   • Received: 180
+   • Points added: 165
+   • Duplicates ignored: 10
+   • Failed/uncredited: 5
+
+   🏆 Current Top 5:
+   🥇 #01 John Doe - 45 pts
+   🥈 #02 Jane Smith - 38 pts
+   ...
+   ```
+
+### Requirements
+
+- Must forward TO bot DM (not in group)
+- Only admins can use this feature
+- Works with privacy settings if "Link account when forwarding" is enabled
+- If original poster has strict privacy: those forwards will be marked as "Failed"
+
+### What Gets Counted
+
+✅ **Counted** (MessageOriginUser):
+- Forwards from users with "Link account when forwarding" enabled
+- Bot extracts: User ID, username, full name
+
+⚠️ **Name-only** (MessageOriginHiddenUser):
+- Forwards from users with privacy settings
+- Bot extracts: Display name only (no Telegram ID)
+- Creates participant with `name:<normalized_name>` identity
+
+❌ **Not Counted** (MessageOriginChat/Channel):
+- Forwards from topics/channels themselves
+- Cannot determine individual user
 
 ## 🔧 How It Works
 
-### Crash-Resistant Backfill
+### Real-Time Topic Tracking
 
-On **every** bot startup (first deploy, crash, Railway redeploy):
-
-1. **Load existing data** from `submissions.json`
-2. **Track message IDs** already processed
-3. **Real-time tracking** starts immediately for new messages
-4. **Send notification** to all admins with sync results
-
-### Message Processing Flow
-
-1. User posts PnL card image in campaign topic
+1. User posts PnL card photo in topic
 2. Bot extracts:
-   - `message_id` (unique identifier)
-   - `photo_id` (for duplicate detection)
-   - User info (ID, username, full name)
-   - Timestamp (for week calculation)
-3. Checks:
-   - ✅ Message ID not already processed
-   - ✅ Photo ID not already submitted by user
-   - ✅ Message within campaign period
-4. Awards 1 point and saves atomically
+   - User ID, username, full name
+   - Photo file_id
+   - Message ID
+3. Creates/updates participant
+4. Adds submission to database (idempotent via UNIQUE constraint)
+5. Increments points
+6. Logs success
 
-### Data Safety Features
+### Batch Forwarding System
 
-- **Atomic Writes**: Temp file → Backup → Atomic move
-- **Automatic Backups**: Created before every update
-- **Corruption Recovery**: Falls back to backup if JSON corrupted
-- **Idempotent Operations**: Safe to run multiple times
+- Uses AsyncIO queue per admin
+- Processes photos in transactions
+- Shows progress every 10 items or 3 seconds
+- Finalizes after 12 seconds of inactivity
+- Single progress message (no spam!)
+- Final summary includes Top 5 snapshot
 
-## 📊 Point System
+### Data Safety
 
-- **1 image = 1 point** (regardless of content)
-- Duplicate photo detection prevents same image counting twice
-- Points tracked both weekly and all-time
-- Weekly leaderboards reset each week
-- Top 5 each week eligible for $5 USDT reward
+- **PostgreSQL transactions**: ACID guarantees
+- **UNIQUE constraints**: Prevent duplicate points
+- **Identity keys**: Track users reliably
+- **Audit trail**: All manual adjustments logged
+- **Idempotent operations**: Safe to retry
 
 ## 🔐 Security
 
 ### Token Masking
-All bot tokens and sensitive user IDs are automatically masked in logs:
+
+Bot tokens masked in logs:
 ```
-Original: Bot token 1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
-Masked:   Bot token [BOT_TOKEN_MASKED]
+Original: postgresql://user:pass@host/db
+Masked:   postgresql://***
 ```
 
 ### Admin Authorization
-- All admin commands restricted to users in `ADMIN_IDS`
-- Sensitive commands require DM (not in groups)
-- User IDs validated before executing privileged operations
+
+- All admin commands verify user ID in `ADMIN_IDS`
+- DM-only commands reject group usage
+- Adjustment commands log admin user ID
 
 ## 🐛 Troubleshooting
 
-### Bot Not Responding
+### Bot Won't Start
 
-1. **Check Railway Logs**:
-   - Go to Railway project → Deployments → View Logs
-   - Look for errors or connection issues
+**Error: "DATABASE_URL environment variable is not set"**
 
-2. **Verify Environment Variables**:
-   - Ensure `BOT_TOKEN` is correct
-   - Check `CHAT_ID` and `TOPIC_ID` are set
-
-3. **Test Bot Token**:
-   ```bash
-   curl https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getMe
-   ```
+**Fix**: Add PostgreSQL plugin and Variable Reference:
+1. Railway project → "+ New" → "Database" → "Add PostgreSQL"
+2. Bot service → Variables → "+ New Variable" → "Reference"
+3. Select PostgreSQL → `DATABASE_URL`
 
 ### Messages Not Being Tracked
 
-1. **Verify Bot Permissions**:
-   - Bot must be admin in the group
-   - Bot needs permission to read messages in topic
+1. **Check topic ID**: Ensure `TOPIC_ID=103380` matches your topic
+2. **Verify bot permissions**: Bot must be admin with message access
+3. **Check logs**: Look for "📸 Photo in topic" messages
 
-2. **Check Campaign Period**:
-   - Messages outside Jan 15 - Feb 11, 2025 are ignored
+### Batch Forwarding Not Working
 
-3. **Check Topic ID**:
-   - Ensure `TOPIC_ID=103380` is correct
-   - Only messages in this specific topic are tracked
+1. **Forward TO bot DM**, not in group
+2. **Check admin ID**: Your ID must be in `ADMIN_IDS`
+3. **Privacy settings**: Original poster needs "Link account when forwarding" enabled
+4. **Check logs**: Look for "📨 Forwarded photo in admin DM" messages
 
-### Data Corruption
+### Database Connection Failed
 
-If JSON files become corrupted:
-1. Bot automatically attempts to restore from `.backup` files
-2. If that fails, creates fresh structure
-3. Check logs for restoration messages
+1. **Check DATABASE_URL**: Should be set automatically by PostgreSQL plugin
+2. **Check Variable Reference**: Bot service must reference PostgreSQL's DATABASE_URL
+3. **Check PostgreSQL status**: Ensure database is running in Railway
 
-Manual recovery:
-```bash
-# In Railway console or locally
-cd /app/data
-cp submissions.json.backup submissions.json
-```
+## 📊 Point System
 
-## 📈 Monitoring
-
-### Admin Notifications
-
-After each restart, admins receive a DM with:
-- Total messages found in topic
-- Number of new submissions added
-- Current top 3 leaderboard
-- Sync duration
-
-### Log Monitoring
-
-Key log messages to watch for:
-- ✅ `Bot initialized, running startup tasks...`
-- ✅ `Backfill complete in X.Xs`
-- ✅ `Sent sync notification to admin`
-- ⚠️ `Duplicate photo detected` (normal)
-- ❌ `Error fetching messages` (needs attention)
+- **1 photo = 1 point** (simple and fair)
+- Duplicate protection via UNIQUE constraint on (participant_id, photo_file_id)
+- No time-based filtering
+- Codes assigned in order (#01, #02, ...)
+- Codes permanent until `/reset`
 
 ## 🔄 Maintenance
 
 ### Weekly Winner Selection
 
-At the end of each week:
-1. DM the bot: `/selectwinners <week>`
-2. Bot responds with Top 5
-3. Winners saved to `winners.json`
-4. Share winners in the campaign topic
+At end of each week:
+1. Run: `/selectwinners 1` (or 2, 3, 4)
+2. Bot saves Top 5 snapshot
+3. Share winners in campaign topic
 
-### Configuration Changes
+### Reset (New Campaign)
 
-To toggle points display:
-- **Enable**: `/pointson`
-- **Disable**: `/pointsoff`
+To start fresh:
+1. Run: `/reset`
+2. Confirm with: `/reset CONFIRM`
+3. All participants deleted
+4. Codes restart from #01
+5. Submissions cleared
+6. Adjustments cleared
 
-Changes apply immediately to future `/pnlrank` commands.
+## 📈 Monitoring
 
-## 📝 Data Files
+### Health Checks
 
-### submissions.json
-Contains all user submissions, points, and campaign stats.
+Run `/test` periodically to verify:
+- Database connection
+- Table integrity
+- Query performance
+- Settings status
 
-### winners.json
-Stores Top 5 winners for each week after `/selectwinners` is run.
+### Performance
 
-### config.json
-Bot configuration including points display setting.
-
-All files have automatic `.backup` versions created before updates.
+Run `/testdata` to check transaction speed.
+Typical result: 20-50ms per transaction.
 
 ## 🚨 Critical Reminders
 
-1. ✅ **Bot syncs on EVERY restart** - no data loss from crashes
-2. ✅ **Message IDs prevent duplicates** - safe to restart anytime
-3. ✅ **Photo IDs catch reposts** - same image won't count twice
-4. ✅ **Atomic writes prevent corruption** - crash during save is safe
-5. ✅ **Backups created automatically** - recovery is built-in
-6. ✅ **Admin notifications** - you'll know when sync completes
+1. ✅ **Add PostgreSQL plugin** - Bot needs DATABASE_URL
+2. ✅ **Add Variable Reference** - Bot service → Reference PostgreSQL DATABASE_URL
+3. ✅ **Batch forwarding** - Forward TO bot DM, not in group
+4. ✅ **Privacy settings** - Users need "Link account when forwarding" enabled
+5. ✅ **Auto-delete** - /pnlrank response disappears after 60s
+6. ✅ **Codes are permanent** - Until /reset, #01 stays #01
 
 ## 📞 Support
 
-For issues or questions:
-1. Check Railway logs first
-2. Verify environment variables
-3. Test bot with `/pnlrank` command
-4. Check admin DMs for sync notifications
+For issues:
+1. Check `/test` command output
+2. Verify Railway environment variables
+3. Check PostgreSQL status in Railway
+4. Review Railway deployment logs
 
-## 📜 License
+## 📜 Architecture
 
-Production deployment for BabaEarn PnL Flex Challenge Campaign (Jan 15 - Feb 11, 2025).
+**Tech Stack**:
+- Python 3.11
+- python-telegram-bot 21.0 (Bot API 7.0+)
+- asyncpg 0.29.0
+- PostgreSQL (Railway plugin)
+- Docker deployment
+
+**Design Principles**:
+- PostgreSQL as source of truth
+- Async/await throughout
+- Transaction-based updates
+- Idempotent operations
+- forward_origin for proper forwards
+- Batch queue system
 
 ---
 
-**Built with**: Python 3.11 | python-telegram-bot 21.0 | Railway
-**Timezone**: Asia/Kolkata (IST)
-**Architecture**: Crash-resistant with automatic recovery
+**Built for**: BabaEarn PnL Flex Challenge Campaign
+**Timezone**: Asia/Kolkata (IST) - for logs only, not logic
+**Architecture**: PostgreSQL + Async + Crash-resistant

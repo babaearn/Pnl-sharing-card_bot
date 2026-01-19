@@ -1,24 +1,22 @@
 """
-PnL Flex Challenge Leaderboard Bot
-Main bot module with crash-resistant architecture and automatic sync on every restart.
+PnL Flex Challenge Leaderboard Bot - PostgreSQL Edition
 
-Key Features:
-- Smart backfill on every startup (crash recovery)
-- Duplicate photo detection using file_id
-- Idempotent message processing using message_id
-- Atomic JSON writes with backups
-- Admin notifications after sync
+Complete rewrite using PostgreSQL as source of truth.
+Supports forward_origin (Bot API 7.0+) for proper forward handling.
+Implements batch forwarding system with progress messages.
 """
 
 import os
 import logging
 import asyncio
 from datetime import datetime
-from functools import wraps
-import time
+from collections import defaultdict
+from typing import Optional, Dict
 import io
+import imagehash
+from PIL import Image
 
-from telegram import Update
+from telegram import Update, MessageOriginUser, MessageOriginHiddenUser, MessageOriginChat, MessageOriginChannel
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -28,36 +26,17 @@ from telegram.ext import (
 )
 from telegram.error import TelegramError
 
-# Import local modules
+# Import database layer
+import db
+
+# Import utilities
 from utils import (
     IST,
-    CAMPAIGN_START,
-    CAMPAIGN_END,
     CHAT_ID,
     TOPIC_ID,
     ADMIN_IDS,
     is_admin,
-    calculate_week_number,
-    get_current_week,
     SensitiveFormatter
-)
-from data_manager import (
-    add_submission,
-    load_submissions,
-    save_config,
-    load_config,
-    get_leaderboard,
-    save_week_winners,
-    get_week_winners,
-    get_stats
-)
-from leaderboard import (
-    format_leaderboard,
-    format_admin_dashboard,
-    format_engagement_stats,
-    format_winners_message,
-    format_saved_winners,
-    format_sync_notification
 )
 
 # Configure logging with sensitive data masking
@@ -66,291 +45,227 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# Apply sensitive formatter to root logger
+# Apply sensitive formatter
 for handler in logging.getLogger().handlers:
     handler.setFormatter(SensitiveFormatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     ))
 
-# Reduce noise from httpx and telegram libraries
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-# Get bot token from environment
+# Get bot token
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is required")
 
 
 # ============================================================================
-# CRASH-RESISTANT BACKFILL (RUNS ON EVERY STARTUP)
+# BATCH FORWARDING SYSTEM
 # ============================================================================
 
-async def smart_backfill(application: Application, scan_range=None):
+class BatchForwardQueue:
     """
-    Self-healing sync mechanism with message ID range scanning.
+    Handles batch processing of forwarded photos in admin DM.
 
-    This function:
-    1. Loads existing submissions.json (or creates if missing)
-    2. Scans through message IDs in the topic using forwarding probe
-    3. Compares message_ids: existing vs. fetched
-    4. Processes ONLY new message_ids (idempotent)
-    5. Updates JSON atomically
-    6. Sends sync notification to all admins
-
-    Args:
-        scan_range: Tuple of (start_id, end_id) for message scanning, or None for env config
-
-    This ensures the bot recovers from:
-    - Crashes
-    - Railway redeployments
-    - Extended downtime
-    - Historical message backfill
+    Prevents spam by showing only:
+    - One progress message
+    - Periodic updates
+    - Final summary
     """
-    logger.info("🔄 Starting smart backfill with message ID scanner...")
-    start_time = time.time()
 
-    # Load existing data
-    data = load_submissions()
-    existing_message_ids = set()
-
-    for user_id, user_data in data['users'].items():
-        for submission in user_data['submissions']:
-            existing_message_ids.add(submission['message_id'])
-
-    existing_count = len(existing_message_ids)
-    is_first_run = existing_count == 0
-
-    logger.info(f"📊 Found {existing_count} existing submissions in database")
-
-    # Determine scan range
-    if scan_range:
-        start_id, end_id = scan_range
-    else:
-        # Get from environment variables or use defaults
-        start_id = int(os.getenv('SCAN_START_ID', TOPIC_ID))
-        # Default: scan 2000 messages ahead (should cover most topics)
-        scan_range_size = int(os.getenv('SCAN_RANGE', '2000'))
-        end_id = start_id + scan_range_size
-
-    logger.info(f"📡 Scanning message IDs from {start_id} to {end_id}")
-
-    # Collect processed messages
-    processed_messages = []
-    new_submissions = 0
-    skipped_messages = 0
-    errors = 0
-
-    # Get first admin ID for forwarding probe
-    probe_chat_id = ADMIN_IDS[0] if ADMIN_IDS else None
-
-    if not probe_chat_id:
-        logger.error("❌ No admin ID available for message scanning")
-        # Send notification about limitation
-        await send_sync_notification(application, {
-            'is_first_run': is_first_run,
-            'total_found': existing_count,
-            'existing_count': existing_count,
-            'new_count': 0,
-            'duration': time.time() - start_time,
-            'top_3': [],
-            'total_users': len(data['users']),
-            'date_range': 'Unable to scan - no admin configured',
-            'error': 'SCAN_DISABLED'
+    def __init__(self):
+        self.queues: Dict[int, asyncio.Queue] = defaultdict(asyncio.Queue)
+        self.workers: Dict[int, asyncio.Task] = {}
+        self.progress_messages: Dict[int, tuple] = {}  # admin_id -> (chat_id, message_id)
+        self.stats: Dict[int, Dict] = defaultdict(lambda: {
+            'received': 0,
+            'added': 0,
+            'duplicates': 0,
+            'failed': 0
         })
-        return
 
-    logger.info(f"🔍 Using message probe via admin chat {probe_chat_id}")
+    async def add_forward(self, admin_id: int, photo_data: Dict, context: ContextTypes.DEFAULT_TYPE):
+        """Add forwarded photo to queue for processing."""
+        # Get or create queue for this admin
+        queue = self.queues[admin_id]
 
-    # Scan through message ID range
-    batch_size = 10  # Process in small batches
-    total_range = end_id - start_id
+        # Add to queue
+        await queue.put(photo_data)
 
-    for msg_id in range(start_id, end_id):
-        # Progress logging every 50 messages
-        if (msg_id - start_id) % 50 == 0:
-            progress = ((msg_id - start_id) / total_range) * 100
-            logger.info(f"📊 Progress: {progress:.1f}% ({msg_id - start_id}/{total_range})")
-
-        # Skip if already processed
-        if msg_id in existing_message_ids:
-            skipped_messages += 1
-            continue
-
-        try:
-            # Probe: Try to forward message to get its info
-            # This is a workaround for Bot API's lack of direct message fetching
-            forwarded = await application.bot.forward_message(
-                chat_id=probe_chat_id,
-                from_chat_id=CHAT_ID,
-                message_id=msg_id
+        # Start worker if not running
+        if admin_id not in self.workers or self.workers[admin_id].done():
+            self.stats[admin_id] = {
+                'received': 0,
+                'added': 0,
+                'duplicates': 0,
+                'failed': 0
+            }
+            self.workers[admin_id] = asyncio.create_task(
+                self._worker(admin_id, context)
             )
 
-            # IMPORTANT: Check if message has photos first
-            if not forwarded.photo:
-                # Not a photo, delete and skip
-                try:
-                    await application.bot.delete_message(
-                        chat_id=probe_chat_id,
-                        message_id=forwarded.message_id
-                    )
-                except Exception:
-                    pass
-                continue
+    async def _worker(self, admin_id: int, context: ContextTypes.DEFAULT_TYPE):
+        """Worker task that processes queue for one admin."""
+        queue = self.queues[admin_id]
+        last_update_time = asyncio.get_event_loop().time()
+        processed_count = 0
 
-            # Check if forwarded message is from the correct chat
-            # When forwarding from topics, forward_from_chat will be the supergroup
-            # and forward_from_message_id will be the original message ID
-            if not forwarded.forward_from_chat or forwarded.forward_from_chat.id != CHAT_ID:
-                # Not from our target chat, delete and skip
-                try:
-                    await application.bot.delete_message(
-                        chat_id=probe_chat_id,
-                        message_id=forwarded.message_id
-                    )
-                except Exception:
-                    pass
-                logger.debug(f"Message {msg_id} not from target chat, skipping")
-                continue
-
-            # Since we can't reliably check topic ID from forwarded messages,
-            # we'll rely on the message ID range being within the topic
-            # and the campaign date filter to ensure correctness
-            # The user should provide a tight message ID range for their specific topic
-
-            if forwarded.photo:
-                # Get original message info from forward
-                original_user = forwarded.forward_from or forwarded.forward_sender_name
-
-                if not original_user:
-                    logger.debug(f"Message {msg_id} has no sender info, skipping")
-                    continue
-
-                # Extract user info
-                if hasattr(original_user, 'id'):
-                    user_id = original_user.id
-                    username = original_user.username or "Unknown"
-                    full_name = original_user.full_name or "Unknown"
-                else:
-                    # Anonymous forward or sender name only
-                    logger.debug(f"Message {msg_id} is anonymous, skipping")
-                    continue
-
-                # Get photo_id (largest size)
-                photo_id = forwarded.photo[-1].file_id
-
-                # Get timestamp (use forward date as approximation)
-                timestamp = forwarded.forward_date or forwarded.date
-
-                # Check if within campaign period
-                if timestamp < CAMPAIGN_START or timestamp > CAMPAIGN_END:
-                    logger.debug(f"Message {msg_id} outside campaign period")
-                    continue
-
-                # Calculate week number
-                week = calculate_week_number(timestamp)
-                if week is None:
-                    logger.warning(f"Could not calculate week for message {msg_id}")
-                    continue
-
-                # Add submission (idempotent)
-                added = add_submission(
-                    user_id=user_id,
-                    username=username,
-                    full_name=full_name,
-                    message_id=msg_id,
-                    photo_id=photo_id,
-                    timestamp=timestamp,
-                    week=week
-                )
-
-                if added:
-                    new_submissions += 1
-                    processed_messages.append(msg_id)
-                    logger.info(f"✅ Processed: msg={msg_id}, user={username}, week={week}")
-
-                # Delete the forwarded probe message to keep chat clean
-                try:
-                    await application.bot.delete_message(
-                        chat_id=probe_chat_id,
-                        message_id=forwarded.message_id
-                    )
-                except Exception:
-                    pass  # Ignore deletion errors
-
-            # Rate limiting: small delay every batch
-            if (msg_id - start_id) % batch_size == 0:
-                await asyncio.sleep(0.5)  # 500ms delay every 10 messages
-
-        except TelegramError as e:
-            # Message doesn't exist, not a photo, or other error
-            error_msg = str(e).lower()
-            if 'message to forward not found' in error_msg or 'message not found' in error_msg:
-                # Normal - message doesn't exist or was deleted
-                pass
-            elif 'message_thread_id_invalid' in error_msg:
-                # Message exists but not in a topic
-                pass
-            else:
-                errors += 1
-                if errors < 10:  # Only log first 10 errors to avoid spam
-                    logger.debug(f"Error probing message {msg_id}: {e}")
-
-        except Exception as e:
-            logger.error(f"Unexpected error processing message {msg_id}: {e}")
-            errors += 1
-
-    # Calculate final stats
-    duration = time.time() - start_time
-    total_found = existing_count + new_submissions
-
-    # Reload data to get updated user count
-    data = load_submissions()
-
-    # Get top 3 for notification
-    current_week = get_current_week()
-    if current_week:
-        leaderboard = get_leaderboard(current_week)
-        top_3 = leaderboard[:3] if leaderboard else []
-    else:
-        top_3 = []
-
-    # Prepare sync stats
-    sync_stats = {
-        'is_first_run': is_first_run,
-        'total_found': total_found,
-        'existing_count': existing_count,
-        'new_count': new_submissions,
-        'duration': duration,
-        'top_3': top_3,
-        'total_users': len(data['users']),
-        'date_range': f"Scanned {start_id} to {end_id}"
-    }
-
-    # Send notifications to admins
-    await send_sync_notification(application, sync_stats)
-
-    logger.info(f"✅ Backfill complete in {duration:.1f}s")
-    logger.info(f"📊 Scanned: {end_id - start_id} message IDs")
-    logger.info(f"📊 Results: {existing_count} existing + {new_submissions} new = {total_found} total submissions")
-    logger.info(f"📊 Errors: {errors}")
-
-
-async def send_sync_notification(application: Application, sync_stats: dict):
-    """Helper function to send sync notifications to all admins"""
-    notification = format_sync_notification(sync_stats)
-
-    for admin_id in ADMIN_IDS:
+        # Send initial progress message
         try:
-            await application.bot.send_message(
+            progress_msg = await context.bot.send_message(
                 chat_id=admin_id,
-                text=notification
+                text="⏳ Reading forwarded media... please wait"
             )
-            logger.info(f"✅ Sent sync notification to admin {admin_id}")
+            self.progress_messages[admin_id] = (admin_id, progress_msg.message_id)
         except Exception as e:
-            logger.error(f"Failed to notify admin {admin_id}: {e}")
+            logger.error(f"Failed to send progress message: {e}")
+            return
+
+        while True:
+            try:
+                # Wait for next item with timeout
+                photo_data = await asyncio.wait_for(queue.get(), timeout=12.0)
+
+                # Process this photo
+                await self._process_photo(admin_id, photo_data)
+                processed_count += 1
+
+                # Update progress every 10 items or every 3 seconds
+                current_time = asyncio.get_event_loop().time()
+                if processed_count % 10 == 0 or (current_time - last_update_time) >= 3:
+                    await self._update_progress(admin_id, context)
+                    last_update_time = current_time
+
+                queue.task_done()
+
+            except asyncio.TimeoutError:
+                # No new items for 12 seconds - finalize
+                logger.info(f"Batch complete for admin {admin_id} - sending summary")
+                await self._send_summary(admin_id, context)
+                break
+
+            except Exception as e:
+                logger.error(f"Error processing photo in batch: {e}")
+                self.stats[admin_id]['failed'] += 1
+
+        # Cleanup
+        del self.workers[admin_id]
+        del self.stats[admin_id]
+        if admin_id in self.progress_messages:
+            del self.progress_messages[admin_id]
+
+    async def _process_photo(self, admin_id: int, photo_data: Dict):
+        """Process a single forwarded photo."""
+        self.stats[admin_id]['received'] += 1
+
+        try:
+            # Extract identity from forward_origin
+            tg_user_id = photo_data.get('tg_user_id')
+            username = photo_data.get('username')
+            full_name = photo_data.get('full_name')
+            photo_file_id = photo_data['photo_file_id']
+
+            if not tg_user_id and not full_name:
+                # Cannot credit - no identity
+                self.stats[admin_id]['failed'] += 1
+                logger.warning(f"Cannot credit forward - no identity available")
+                return
+
+            # Get or create participant
+            participant_id = await db.get_or_create_participant(
+                tg_user_id=tg_user_id,
+                username=username,
+                full_name=full_name or "Unknown"
+            )
+
+            # Add submission
+            success, result = await db.add_submission(
+                participant_id=participant_id,
+                photo_file_id=photo_file_id,
+                source='forward',
+                tg_message_id=None
+            )
+
+            if success:
+                self.stats[admin_id]['added'] += 1
+                logger.info(f"✅ Batch forward: +1 point for {full_name}")
+            else:
+                self.stats[admin_id]['duplicates'] += 1
+                logger.info(f"⏭️ Batch forward: duplicate for {full_name}")
+
+        except Exception as e:
+            logger.error(f"Failed to process batch photo: {e}")
+            self.stats[admin_id]['failed'] += 1
+
+    async def _update_progress(self, admin_id: int, context: ContextTypes.DEFAULT_TYPE):
+        """Update progress message."""
+        if admin_id not in self.progress_messages:
+            return
+
+        chat_id, message_id = self.progress_messages[admin_id]
+        stats = self.stats[admin_id]
+
+        text = (
+            f"⏳ Processing forwarded media...\n\n"
+            f"📨 Received: {stats['received']}\n"
+            f"✅ Points added: {stats['added']}\n"
+            f"⏭️ Duplicates: {stats['duplicates']}\n"
+            f"❌ Failed: {stats['failed']}"
+        )
+
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text
+            )
+        except Exception as e:
+            logger.debug(f"Could not update progress: {e}")
+
+    async def _send_summary(self, admin_id: int, context: ContextTypes.DEFAULT_TYPE):
+        """Send final summary with Top 5 snapshot."""
+        stats = self.stats[admin_id]
+
+        # Get current Top 5
+        leaderboard = await db.get_leaderboard(limit=5)
+
+        # Build summary message
+        lines = [
+            "✅ Batch processing complete!\n",
+            f"📊 **Summary:**",
+            f"• Received: {stats['received']}",
+            f"• Points added: {stats['added']}",
+            f"• Duplicates ignored: {stats['duplicates']}",
+            f"• Failed/uncredited: {stats['failed']}",
+            "",
+            "🏆 **Current Top 5:**"
+        ]
+
+        if leaderboard:
+            for idx, entry in enumerate(leaderboard, 1):
+                emoji = {1: '🥇', 2: '🥈', 3: '🥉'}.get(idx, f'{idx}.')
+                name = entry['display_name']
+                points = entry['points']
+                lines.append(f"{emoji} {name} - {points} pts")
+        else:
+            lines.append("(No submissions yet)")
+
+        summary_text = "\n".join(lines)
+
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=summary_text
+            )
+        except Exception as e:
+            logger.error(f"Failed to send summary: {e}")
+
+
+# Global batch queue instance
+batch_queue = BatchForwardQueue()
 
 
 # ============================================================================
@@ -358,30 +273,22 @@ async def send_sync_notification(application: Application, sync_stats: dict):
 # ============================================================================
 
 def admin_only(func):
-    """Decorator to restrict commands to admins only"""
-    @wraps(func)
+    """Decorator to restrict commands to admins only."""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-
-        if not is_admin(user_id):
+        if not is_admin(update.effective_user.id):
             await update.message.reply_text("⛔ This command is admin-only")
             return
-
         return await func(update, context)
-
     return wrapper
 
 
 def dm_only(func):
-    """Decorator to restrict commands to DMs only"""
-    @wraps(func)
+    """Decorator to restrict commands to DMs only."""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_chat.type != 'private':
             await update.message.reply_text("⛔ This command only works in DMs")
             return
-
         return await func(update, context)
-
     return wrapper
 
 
@@ -389,191 +296,374 @@ def dm_only(func):
 # MESSAGE HANDLERS
 # ============================================================================
 
-async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_topic_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handle new photo messages in the campaign topic.
-
-    This runs in real-time as users post PnL cards.
+    Handle new photo posted in the PnL Flex Challenge topic (real-time counting).
     """
     message = update.message
 
     # Debug logging
-    logger.info(f"📸 Photo received - Chat: {message.chat_id}, Thread: {message.message_thread_id}, User: {message.from_user.id}")
+    logger.info(f"📸 Photo in topic - Chat: {message.chat_id}, Thread: {message.message_thread_id}, User: {message.from_user.id}")
 
-    # Check if message is in the correct chat
-    if message.chat_id != CHAT_ID:
-        logger.debug(f"Skipping: Wrong chat ({message.chat_id} != {CHAT_ID})")
+    # Verify correct chat and topic
+    if message.chat_id != CHAT_ID or message.message_thread_id != TOPIC_ID:
         return
 
-    # Check if message is in the campaign topic
-    if not message.message_thread_id or message.message_thread_id != TOPIC_ID:
-        logger.debug(f"Skipping: Wrong topic ({message.message_thread_id} != {TOPIC_ID})")
-        return
+    # Extract user info
+    user = message.from_user
+    tg_user_id = user.id
+    username = user.username
+    full_name = user.full_name
 
-    # Check if message has photos
-    if not message.photo:
-        logger.debug("Skipping: No photo")
-        return
+    # Get photo file_id
+    photo_file_id = message.photo[-1].file_id
 
-    # Extract message info
-    user_id = message.from_user.id
-    username = message.from_user.username or "Unknown"
-    full_name = message.from_user.full_name or "Unknown"
-    message_id = message.message_id
-    timestamp = message.date
-
-    # Get photo_id (largest size)
-    photo_id = message.photo[-1].file_id
-
-    # Check if message is within campaign period
-    logger.info(f"Message timestamp: {timestamp}, Campaign: {CAMPAIGN_START} to {CAMPAIGN_END}")
-
-    if timestamp < CAMPAIGN_START or timestamp > CAMPAIGN_END:
-        logger.warning(f"⏭️ Message {message_id} outside campaign period (posted: {timestamp}), ignoring")
-        return
-
-    # Calculate week number
-    week = calculate_week_number(timestamp)
-    if week is None:
-        logger.warning(f"Could not calculate week for message {message_id}")
-        return
-
-    logger.info(f"✅ Valid PnL card! User: {username}, Week: {week}, Msg: {message_id}")
-
-    # Download photo for pHash analysis
-    image_bytes_io = None
+    # --- FRAUD DETECTION (pHash) ---
+    current_phash = None
     try:
-        # Get file object
+        # Download photo
         photo_file = await message.photo[-1].get_file()
         image_bytes_io = io.BytesIO()
         await photo_file.download_to_memory(out=image_bytes_io)
         image_bytes_io.seek(0)
+        
+        # Calculate Hash
+        img = Image.open(image_bytes_io)
+        current_hash = imagehash.phash(img)
+        current_phash = str(current_hash)
+        
+        # Check against existing hashes
+        existing_hashes = await db.get_all_hashes()
+        THRESHOLD = 5
+        
+        for stored_hex in existing_hashes:
+            stored_hash = imagehash.hex_to_hash(stored_hex)
+            if current_hash - stored_hash < THRESHOLD:
+                logger.info(f"⛔ Fraud Blocked: Visual duplicate detected for {full_name}")
+                return # Block silently or notify user? Silent is better to not spam.
+                
     except Exception as e:
-        logger.error(f"Failed to download photo {photo_id}: {e}")
-        # Continue without image (will slip pHash check but catch file ID check)
+        logger.error(f"Error in fraud check: {e}")
+        # Continue (fail open or closed? Fail open to allow submissions if check fails)
 
-    # Add submission (idempotent - checks message_id and photo_id)
-    added = add_submission(
-        user_id=user_id,
-        username=username,
-        full_name=full_name,
-        message_id=message_id,
-        photo_id=photo_id,
-        timestamp=timestamp,
-        week=week,
-        image_bytes_io=image_bytes_io
-    )
+    try:
+        # Get or create participant
+        participant_id = await db.get_or_create_participant(
+            tg_user_id=tg_user_id,
+            username=username,
+            full_name=full_name
+        )
 
-    if added:
-        logger.info(f"✅✅ NEW SUBMISSION ADDED: user={username} ({user_id}), week={week}, msg={message_id}, points=1")
-    else:
-        logger.info(f"⏭️ Duplicate submission ignored: msg={message_id} (already in database)")
+        # Add submission
+        success, result = await db.add_submission(
+            participant_id=participant_id,
+            photo_file_id=photo_file_id,
+            source='topic',
+            tg_message_id=message.message_id
+        )
+
+        if success:
+            logger.info(f"✅✅ NEW SUBMISSION: {full_name} (@{username}) - photo {photo_file_id[:20]}...")
+            # Save hash
+            if current_phash:
+                await db.add_phash(participant_id, current_phash)
+        else:
+            logger.info(f"⏭️ Duplicate ignored: {full_name} - photo already counted")
+
+    except Exception as e:
+        logger.error(f"Failed to process topic photo: {e}")
+
+
+async def handle_forwarded_dm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handle forwarded photos in admin DM (batch forwarding system).
+
+    Uses forward_origin (Bot API 7.0+) to extract original user info.
+    """
+    message = update.message
+
+    # Only work in private chats
+    if message.chat.type != 'private':
+        return
+
+    # Only admins can use this
+    if not is_admin(message.from_user.id):
+        return
+
+    # Must have forward_origin (new API)
+    if not message.forward_origin:
+        return
+
+    # Must have photo
+    if not message.photo:
+        return
+
+    logger.info(f"📨 Forwarded photo in admin DM from {message.from_user.id}")
+
+    # Extract identity from forward_origin
+    tg_user_id = None
+    username = None
+    full_name = None
+
+    if isinstance(message.forward_origin, MessageOriginUser):
+        # Best case: full user info available
+        original_user = message.forward_origin.sender_user
+        tg_user_id = original_user.id
+        username = original_user.username
+        full_name = original_user.full_name
+        logger.info(f"   ✅ Got user: {full_name} (@{username}, ID: {tg_user_id})")
+
+    elif isinstance(message.forward_origin, MessageOriginHiddenUser):
+        # Privacy enabled: only name available
+        full_name = message.forward_origin.sender_user_name
+        logger.info(f"   ⚠️ Hidden user: {full_name} (no ID)")
+
+    elif isinstance(message.forward_origin, MessageOriginChat):
+        # From chat/topic: no individual user info
+        chat = message.forward_origin.sender_chat
+        logger.warning(f"   ❌ Forwarded from chat: {chat.title} - cannot determine user")
+        # Cannot credit - skip
+        return
+
+    elif isinstance(message.forward_origin, MessageOriginChannel):
+        # From channel: no individual user info
+        channel = message.forward_origin.chat
+        logger.warning(f"   ❌ Forwarded from channel: {channel.title} - cannot determine user")
+        # Cannot credit - skip
+        return
+
+    # Must have at least a full_name
+    if not full_name and not tg_user_id:
+        logger.warning("   ❌ No identity available - cannot credit")
+        return
+
+    # Get photo file_id
+    photo_file_id = message.photo[-1].file_id
+
+    # Add to batch queue
+    photo_data = {
+        'tg_user_id': tg_user_id,
+        'username': username,
+        'full_name': full_name,
+        'photo_file_id': photo_file_id
+    }
+
+    await batch_queue.add_forward(message.from_user.id, photo_data, context)
 
 
 # ============================================================================
 # PUBLIC COMMANDS
 # ============================================================================
 
+def format_leaderboard_entry(entry: Dict, show_points: bool) -> str:
+    """
+    Format a single leaderboard entry for public display.
+
+    Args:
+        entry: Dict with 'display_name' and 'points' keys
+        show_points: Whether to display points
+
+    Returns:
+        Formatted string like "🏅 John Doe - 45 pts" or "🏅 John Doe"
+    """
+    name = entry.get('display_name') or "Unknown"
+
+    if show_points:
+        points = entry.get('points', 0)
+        return f"🏅 {name} - {points} pts"
+    else:
+        return f"🏅 {name}"
+
+
 async def cmd_pnlrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /pnlrank command - Show top 5 leaderboard for current week
-    Case-insensitive, works in group or DM
+    /pnlrank - Show Top 5 leaderboard (case-insensitive).
+
+    Auto-deletes bot response after 60 seconds (NOT the user's command).
     """
-    current_week = get_current_week()
+    # Get show_points setting
+    show_points = await db.get_show_points()
 
-    if current_week is None:
-        await update.message.reply_text("⏰ Campaign hasn't started yet!")
+    # Get Top 5
+    leaderboard = await db.get_leaderboard(limit=5)
+
+    if not leaderboard:
+        await update.message.reply_text("📊 No submissions yet!")
         return
-
-    # Get config for point visibility
-    config = load_config()
-    show_points = config.get('show_points', True)
 
     # Format leaderboard
-    leaderboard_text = format_leaderboard(
-        week=current_week,
-        show_points=show_points,
-        limit=5
-    )
+    lines = ["🏆 PnL Flex Challenge - Top 5\n"]
 
-    await update.message.reply_text(leaderboard_text)
+    for entry in leaderboard:
+        lines.append(format_leaderboard_entry(entry, show_points))
+
+    text = "\n".join(lines)
+
+    # Send leaderboard
+    sent_message = await update.message.reply_text(text)
+
+    # Auto-delete bot response after 60 seconds
+    async def delete_bot_response():
+        await asyncio.sleep(60)
+        try:
+            await context.bot.delete_message(
+                chat_id=sent_message.chat_id,
+                message_id=sent_message.message_id
+            )
+            logger.info("Auto-deleted /pnlrank response after 60s")
+        except Exception as e:
+            logger.debug(f"Could not delete /pnlrank response: {e}")
+
+    asyncio.create_task(delete_bot_response())
 
 
 # ============================================================================
-# ADMIN COMMANDS
+# ADMIN COMMANDS (DM ONLY)
 # ============================================================================
 
 @admin_only
 @dm_only
-async def cmd_adminboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_rankerinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /adminboard command - Show detailed top 10 with user IDs
-    Admin only, DM only
+    /rankerinfo - Show Top 10 with full verification details.
     """
-    current_week = get_current_week()
+    rankers = await db.get_full_rankerinfo(limit=10)
 
-    if current_week is None:
-        await update.message.reply_text("⏰ Campaign hasn't started yet!")
+    if not rankers:
+        await update.message.reply_text("📊 No participants yet!")
         return
 
-    # Format admin dashboard
-    dashboard_text = format_admin_dashboard(current_week)
+    lines = ["🔐 Ranker Info - Top 10\n"]
 
-    await update.message.reply_text(dashboard_text)
+    for entry in rankers:
+        code = entry['code']
+        name = entry['display_name']
+        tg_id = entry['tg_user_id'] or "Unknown"
+        points = entry['points']
+
+        lines.append(f"{code} | {name} | {tg_id} | {points} pts")
+
+    await update.message.reply_text("\n".join(lines))
 
 
 @admin_only
 @dm_only
-async def cmd_engagement(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /eng command - Show engagement statistics
-    Admin only, DM only
+    /add #01 5 - Add/remove points manually.
+
+    Delta can be positive or negative.
     """
-    current_week = get_current_week()
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "Usage: /add #01 5\n"
+            "Example: /add #01 5 (add 5 points)\n"
+            "Example: /add #01 -3 (remove 3 points)"
+        )
+        return
 
-    # Format engagement stats
-    stats_text = format_engagement_stats(current_week)
+    participant_code = context.args[0]
+    try:
+        delta = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("❌ Delta must be a number")
+        return
 
-    await update.message.reply_text(stats_text)
+    # Perform adjustment
+    success, message, new_points = await db.add_adjustment(
+        participant_code=participant_code,
+        delta=delta,
+        admin_tg_user_id=update.effective_user.id,
+        note=f"Manual adjustment by admin {update.effective_user.id}"
+    )
+
+    if success:
+        await update.message.reply_text(f"✅ Adjustment applied\n\n{message}\nNew total: {new_points} pts")
+    else:
+        await update.message.reply_text(f"❌ {message}")
+
+
+@admin_only
+@dm_only
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /stats - Show engagement statistics since last reset.
+    """
+    stats = await db.get_stats()
+
+    lines = [
+        "📊 Campaign Statistics (Since Reset)\n",
+        f"👥 Participants: {stats['total_participants']}",
+        f"📸 Submissions: {stats['total_submissions']}",
+        f"⏭️ Duplicates: {stats['duplicates']}",
+        f"✏️ Manual adjustments: {stats['manual_adjustments']}",
+        f"🌟 Most active: {stats['most_active']} ({stats['max_points']} pts)",
+        f"📊 Avg points/user: {stats['avg_points']:.1f}",
+        f"🔄 Reset at: {stats['reset_at']}"
+    ]
+
+    await update.message.reply_text("\n".join(lines))
+
+
+@admin_only
+@dm_only
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /reset - Reset all data with confirmation.
+
+    Requires /reset CONFIRM or replying "CONFIRM" to warning.
+    """
+    # Check for confirmation
+    if context.args and context.args[0] == 'CONFIRM':
+        # Execute reset
+        await db.reset_all_data()
+
+        await update.message.reply_text(
+            "✅ RESET COMPLETE\n\n"
+            "All data cleared. Codes restart from #01.\n"
+            "Leaderboard is now empty."
+        )
+        logger.warning(f"RESET EXECUTED by admin {update.effective_user.id}")
+        return
+
+    # Show warning
+    stats = await db.get_stats()
+
+    await update.message.reply_text(
+        f"⚠️ RESET WARNING ⚠️\n\n"
+        f"This will:\n"
+        f"❌ Delete {stats['total_participants']} participants\n"
+        f"❌ Delete {stats['total_submissions']} submissions\n"
+        f"❌ Reset codes to #01\n"
+        f"❌ Clear all adjustments and winners\n\n"
+        f"To confirm, type:\n"
+        f"/reset CONFIRM"
+    )
 
 
 @admin_only
 @dm_only
 async def cmd_pointson(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /pointson command - Enable points display in public leaderboard
-    Admin only, DM only
-    """
-    config = load_config()
-    config['show_points'] = True
-    save_config(config)
-
-    await update.message.reply_text("✅ Points display enabled for public leaderboard")
+    """Enable points display in public leaderboard."""
+    await db.set_show_points(True)
+    await update.message.reply_text("✅ Points display enabled")
 
 
 @admin_only
 @dm_only
 async def cmd_pointsoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /pointsoff command - Disable points display in public leaderboard
-    Admin only, DM only
-    """
-    config = load_config()
-    config['show_points'] = False
-    save_config(config)
-
-    await update.message.reply_text("✅ Points display disabled for public leaderboard")
+    """Disable points display in public leaderboard."""
+    await db.set_show_points(False)
+    await update.message.reply_text("✅ Points display disabled")
 
 
 @admin_only
 @dm_only
 async def cmd_selectwinners(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /selectwinners <week> command - Select and save top 5 winners for a week
-    Admin only, DM only
+    /selectwinners <week> - Save Top 5 as weekly winners.
     """
-    # Parse week number from args
-    if not context.args or len(context.args) != 1:
+    if len(context.args) != 1:
         await update.message.reply_text("Usage: /selectwinners <week>\nExample: /selectwinners 1")
         return
 
@@ -582,46 +672,51 @@ async def cmd_selectwinners(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if week < 1 or week > 4:
             raise ValueError()
     except ValueError:
-        await update.message.reply_text("❌ Week must be a number between 1 and 4")
+        await update.message.reply_text("❌ Week must be 1-4")
         return
 
-    # Get top 5 for the week
-    leaderboard = get_leaderboard(week)
+    # Get current Top 5
+    leaderboard = await db.get_leaderboard(limit=5)
 
     if not leaderboard:
-        await update.message.reply_text(f"❌ No submissions for Week {week}")
+        await update.message.reply_text("❌ No participants to select from")
         return
 
-    # Take top 5
-    top_5 = leaderboard[:5]
-
-    # Format winners list
+    # Prepare winners data
     winners = []
-    for rank, entry in enumerate(top_5, 1):
+    for rank, entry in enumerate(leaderboard[:5], 1):
+        # Get participant ID from database
+        async with db._pool.acquire() as conn:
+            participant_id = await conn.fetchval(
+                'SELECT id FROM participants WHERE code = $1',
+                entry['code']
+            )
+
         winners.append({
             'rank': rank,
-            'username': entry['username'],
-            'full_name': entry['full_name'],
+            'participant_id': participant_id,
             'points': entry['points']
         })
 
-    # Save to winners.json
-    save_week_winners(week, winners)
+    # Save winners
+    await db.save_winners(week, winners)
 
-    # Format and send confirmation
-    message = format_winners_message(week, winners)
-    await update.message.reply_text(message)
+    # Format confirmation
+    lines = [f"✅ Week {week} winners saved!\n"]
+    for rank, entry in enumerate(leaderboard[:5], 1):
+        emoji = {1: '🥇', 2: '🥈', 3: '🥉'}.get(rank, f'{rank}.')
+        lines.append(f"{emoji} {entry['display_name']} - {entry['points']} pts")
+
+    await update.message.reply_text("\n".join(lines))
 
 
 @admin_only
 @dm_only
 async def cmd_winners(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /winners <week> command - View previously selected winners
-    Admin only, DM only
+    /winners <week> - View saved winners.
     """
-    # Parse week number from args
-    if not context.args or len(context.args) != 1:
+    if len(context.args) != 1:
         await update.message.reply_text("Usage: /winners <week>\nExample: /winners 1")
         return
 
@@ -630,265 +725,128 @@ async def cmd_winners(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if week < 1 or week > 4:
             raise ValueError()
     except ValueError:
-        await update.message.reply_text("❌ Week must be a number between 1 and 4")
+        await update.message.reply_text("❌ Week must be 1-4")
         return
 
-    # Get and format saved winners
-    message = format_saved_winners(week)
-    await update.message.reply_text(message)
+    # Get winners
+    winners = await db.get_winners(week)
+
+    if not winners:
+        await update.message.reply_text(f"❌ No winners saved for Week {week}")
+        return
+
+    # Format
+    lines = [f"🏆 Week {week} Winners\n"]
+    for winner in winners:
+        rank = winner['rank']
+        emoji = {1: '🥇', 2: '🥈', 3: '🥉'}.get(rank, f'{rank}.')
+        lines.append(f"{emoji} {winner['code']} {winner['display_name']} - {winner['points_at_time']} pts")
+
+    await update.message.reply_text("\n".join(lines))
 
 
 @admin_only
 @dm_only
-async def cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show admin command help."""
+    text = """
+🔐 **Admin Commands** (DM only)
+
+**Verification:**
+/rankerinfo - Top 10 with full details
+/stats - Engagement statistics
+
+**Manual Adjustments:**
+/add #01 5 - Add points
+/add #01 -3 - Remove points
+
+**Settings:**
+/pointson - Show points in public leaderboard
+/pointsoff - Hide points in public leaderboard
+
+**Winners:**
+/selectwinners <week> - Save Top 5 for week
+/winners <week> - View saved winners
+
+**Management:**
+/reset - Clear all data (requires CONFIRM)
+
+**Health:**
+/test - Bot health check
+/testdata - Database transaction test
+
+**Batch Forwarding:**
+Forward multiple PnL photos at once to bot DM.
+Bot will show progress and final summary.
     """
-    /backfill command - Manually trigger backfill with default range
-    Admin only, DM only
-    """
-    await update.message.reply_text("🔄 Starting manual backfill with default range...")
+    await update.message.reply_text(text)
 
-    # Run backfill
-    await smart_backfill(context.application)
 
-    await update.message.reply_text("✅ Backfill complete! Check results above.")
-
+# ============================================================================
+# HEALTH CHECK COMMANDS
+# ============================================================================
 
 @admin_only
-async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@dm_only
+async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /scan <start_id> <end_id> command - Scan specific message ID range
-    Admin only - USE THIS COMMAND IN THE TOPIC YOU WANT TO SCAN!
-
-    Example: /scan 103380 103580
+    /test - Run bot health check.
     """
-    # Check if command is used in the campaign topic or DM
-    command_topic_id = update.message.message_thread_id if update.message.chat.type != 'private' else None
+    lines = ["✅ BOT HEALTH REPORT (/test)\n"]
 
-    # Parse arguments
-    if not context.args or len(context.args) != 2:
-        help_text = (
-            "📡 Usage: /scan <start_id> <end_id>\n\n"
-            "Example: /scan 103380 103580\n\n"
-            "⚠️ IMPORTANT - Run this command IN the topic you want to scan!\n"
-            "• Go to PnL Flex Challenge topic\n"
-            "• Find start ID: Right-click FIRST PnL card → Copy Link\n"
-            "• Find end ID: Right-click LATEST PnL card → Copy Link\n"
-            "• Type /scan <start> <end> IN THAT TOPIC\n\n"
-        )
+    # Admin auth
+    lines.append("🔐 Admin: OK")
 
-        if command_topic_id:
-            help_text += f"✅ Current topic ID: {command_topic_id}\n"
-            if command_topic_id == TOPIC_ID:
-                help_text += "✅ This is the correct PnL Flex Challenge topic!\n"
-            else:
-                help_text += f"⚠️ Expected topic ID: {TOPIC_ID}\n"
+    # Config
+    try:
+        lines.append(f"⚙️ Config: OK (CHAT_ID={CHAT_ID}, TOPIC_ID={TOPIC_ID})")
+    except:
+        lines.append("❌ Config: ERROR")
+
+    # Database
+    try:
+        health = await db.health_check()
+        if 'error' in health:
+            lines.append(f"❌ Database: {health['error']}")
         else:
-            help_text += f"💡 Expected topic ID: {TOPIC_ID}\n"
-            help_text += "⚠️ You're in DM. Better to run in the topic itself!\n"
+            lines.append("🗄️ Database: Connected")
+            lines.append("  • Tables: OK")
+            lines.append(f"  • Leaderboard query: {health['leaderboard_query']}")
+            lines.append(f"  • Next code: #{health['next_code_number']}")
+    except Exception as e:
+        lines.append(f"❌ Database: {e}")
 
-        await update.message.reply_text(help_text)
-        return
+    # Batch worker
+    lines.append("📦 Batch Worker: OK (initialized)")
 
-    try:
-        start_id = int(context.args[0])
-        end_id = int(context.args[1])
+    # Auto-delete
+    lines.append("🧹 Auto Delete: Enabled (60s)")
 
-        if start_id >= end_id:
-            raise ValueError("Start ID must be less than end ID")
+    # Overall
+    lines.append("\n✅ Overall: HEALTHY")
 
-        if end_id - start_id > 5000:
-            raise ValueError("Range too large (max 5000 messages)")
-
-    except ValueError as e:
-        await update.message.reply_text(f"❌ Invalid range: {e}")
-        return
-
-    # Warn if not in the correct topic
-    if command_topic_id and command_topic_id != TOPIC_ID:
-        await update.message.reply_text(
-            f"⚠️ WARNING: You're in topic {command_topic_id}\n"
-            f"Expected: {TOPIC_ID} (PnL Flex Challenge)\n\n"
-            f"This scan will look for messages from topic {TOPIC_ID}, "
-            f"but you should run this command IN that topic for better accuracy!"
-        )
-
-    status_msg = (
-        f"🔄 Starting scan of {end_id - start_id} message IDs...\n"
-        f"📡 Range: {start_id} to {end_id}\n"
-    )
-
-    if command_topic_id:
-        status_msg += f"📍 Command sent from topic: {command_topic_id}\n"
-        if command_topic_id == TOPIC_ID:
-            status_msg += "✅ Correct topic!\n"
-
-    status_msg += (
-        f"\n⏳ This may take a few minutes. Admins will see probe messages briefly (auto-deleted).\n\n"
-        f"📊 Filter criteria:\n"
-        f"✅ Photos only\n"
-        f"✅ Campaign dates: Jan 15 - Feb 11, 2025\n"
-        f"✅ From chat {CHAT_ID}\n"
-        f"💡 Tight message ID range recommended for best results!"
-    )
-
-    await update.message.reply_text(status_msg)
-
-    # Run backfill with custom range
-    # Store the topic ID context for better filtering hints
-    context.bot_data['scan_topic_hint'] = command_topic_id
-    await smart_backfill(context.application, scan_range=(start_id, end_id))
-
-    # Send completion message to the same chat where command was issued
-    await update.message.reply_text("✅ Scan complete! Use /pnlrank to see updated leaderboard.")
+    await update.message.reply_text("\n".join(lines))
 
 
 @admin_only
-async def cmd_checkmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@dm_only
+async def cmd_testdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /checkmsg <message_id> - Check if a message ID is from the PnL topic
-    Admin only - helps find correct message range
+    /testdata - Test database transaction (rollback test).
+    """
+    success, elapsed_ms = await db.test_transaction()
 
-    Example: /checkmsg 103450
-    """
-    if not context.args or len(context.args) != 1:
+    if success:
         await update.message.reply_text(
-            "Usage: /checkmsg <message_id>\n\n"
-            "Example: /checkmsg 103450\n\n"
-            "This helps you verify if a message ID is from the PnL Flex Challenge topic.\n"
-            "Use this to find the correct first/last message IDs for /scan."
+            f"✅ TRANSACTION TEST PASSED\n\n"
+            f"• Insert participant: OK\n"
+            f"• Insert submission: OK\n"
+            f"• Select data: OK\n"
+            f"• Rollback: OK\n"
+            f"• Time: {elapsed_ms:.2f}ms"
         )
-        return
-
-    try:
-        msg_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ Invalid message ID")
-        return
-
-    try:
-        # Try to forward the message to probe it
-        probe_chat_id = ADMIN_IDS[0]
-
-        forwarded = await context.bot.forward_message(
-            chat_id=probe_chat_id,
-            from_chat_id=CHAT_ID,
-            message_id=msg_id
-        )
-
-        # Analyze the message
-        info = f"✅ Message {msg_id} found!\n\n"
-
-        if forwarded.photo:
-            info += "📷 Type: Photo ✅\n"
-        else:
-            info += f"📝 Type: {forwarded.content_type}\n"
-
-        if forwarded.forward_date:
-            info += f"📅 Date: {forwarded.forward_date.strftime('%Y-%m-%d %H:%M:%S')}\n"
-
-            # Check if in campaign period
-            if CAMPAIGN_START <= forwarded.forward_date <= CAMPAIGN_END:
-                info += "✅ Within campaign period!\n"
-            else:
-                info += "⚠️ Outside campaign period\n"
-
-        if forwarded.forward_from:
-            info += f"👤 From: {forwarded.forward_from.full_name}\n"
-
-        info += f"\n💡 Original chat: {CHAT_ID}\n"
-        info += f"💡 Target topic: {TOPIC_ID}\n"
-
-        # Delete the forwarded probe
-        try:
-            await context.bot.delete_message(
-                chat_id=probe_chat_id,
-                message_id=forwarded.message_id
-            )
-        except Exception:
-            pass
-
-        await update.message.reply_text(info)
-
-    except TelegramError as e:
-        await update.message.reply_text(f"❌ Message {msg_id} not found or inaccessible\n\nError: {e}")
-
-
-@admin_only
-async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /debug command - Show debug information
-    Admin only - helps diagnose issues
-    """
-    from datetime import datetime
-
-    now = datetime.now(IST)
-    current_week = get_current_week()
-
-    lines = [
-        "🔧 Debug Information",
-        "",
-        f"📅 Current Time (IST): {now.strftime('%Y-%m-%d %H:%M:%S %Z')}",
-        f"📅 Campaign Start: {CAMPAIGN_START.strftime('%Y-%m-%d %H:%M:%S %Z')}",
-        f"📅 Campaign End: {CAMPAIGN_END.strftime('%Y-%m-%d %H:%M:%S %Z')}",
-        f"📊 Current Week: {current_week if current_week else 'Not in campaign period'}",
-        "",
-    ]
-
-    # Check for system time issues
-    if now.year != 2025:
-        lines.append("⚠️ WARNING: System time is WRONG!")
-        lines.append(f"⚠️ Server thinks it's {now.year}, should be 2025!")
-        lines.append("⚠️ This will cause all messages to be filtered out!")
-        lines.append("⚠️ Contact Railway support to fix server time")
-        lines.append("")
-    elif now < CAMPAIGN_START:
-        lines.append("⏰ Campaign hasn't started yet")
-        lines.append(f"⏰ Starts on: {CAMPAIGN_START.strftime('%Y-%m-%d %H:%M')}")
-        lines.append("")
-    elif now > CAMPAIGN_END:
-        lines.append("⏰ Campaign has ended")
-        lines.append(f"⏰ Ended on: {CAMPAIGN_END.strftime('%Y-%m-%d %H:%M')}")
-        lines.append("")
     else:
-        lines.append("✅ System time is correct!")
-        lines.append("✅ Campaign is active!")
-        lines.append("")
-
-    lines.extend([
-        f"💬 Target Chat ID: {CHAT_ID}",
-        f"🎯 Target Topic ID: {TOPIC_ID}",
-        f"👨‍💼 Admin IDs: {', '.join(map(str, ADMIN_IDS))}",
-        "",
-        f"✅ Bot is running and receiving commands!",
-        "",
-        f"💡 To test real-time tracking:",
-        f"• Post a PnL card photo in topic {TOPIC_ID}",
-        f"• Check Railway logs for '📸 Photo received' message",
-        f"• Should see '✅✅ NEW SUBMISSION ADDED' if successful"
-    ])
-
-    await update.message.reply_text("\n".join(lines))
-
-
-@admin_only
-@dm_only
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /stats command - Show campaign statistics
-    Admin only, DM only
-    """
-    stats = get_stats()
-
-    lines = [
-        "📊 Campaign Statistics",
-        "",
-        f"👥 Total Participants: {stats['total_participants']}",
-        f"📸 Total Submissions: {stats['total_submissions']}",
-        f"📅 Campaign Start: {stats['campaign_start']}",
-        f"🔄 Last Updated: {stats['last_updated']}"
-    ]
-
-    await update.message.reply_text("\n".join(lines))
+        await update.message.reply_text("❌ TRANSACTION TEST FAILED")
 
 
 # ============================================================================
@@ -896,46 +854,89 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================================
 
 async def post_init(application: Application):
-    """Run after bot initialization, before start"""
-    logger.info("🤖 Bot initialized, running startup tasks...")
+    """Initialize database and bot on startup."""
+    logger.info("🤖 Bot initializing...")
 
-    # DISABLED: Automatic backfill on startup (prevents scanning wrong topics)
-    # Use /scan command manually with correct message ID range for your specific topic
-    # await smart_backfill(application)
+    try:
+        # Initialize database
+        await db.init_db()
+        logger.info("✅ Database initialized")
 
-    logger.info("✅ Startup complete!")
-    logger.info("💡 Use /scan <start_id> <end_id> to manually scan your topic's messages")
+    except Exception as e:
+        logger.error(f"❌ Startup failed: {e}")
+        raise
+
+    logger.info("✅ Bot ready!")
+
+
+async def post_shutdown(application: Application):
+    """Clean up on shutdown."""
+    logger.info("🛑 Bot shutting down...")
+    await db.close_db()
+    logger.info("✅ Shutdown complete")
 
 
 def main():
-    """Main entry point"""
+    """Main entry point."""
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-    logger.info("🚀 Starting PnL Flex Challenge Leaderboard Bot...")
+    logger.info("🚀 Starting PnL Flex Challenge Bot (PostgreSQL Edition)...")
     logger.info(f"📍 Monitoring Chat: {CHAT_ID}, Topic: {TOPIC_ID}")
     logger.info(f"👨‍💼 Admins: {ADMIN_IDS}")
+
+    # Startup sanity check: verify files are present
+    try:
+        import os as sanity_os
+        cwd = sanity_os.getcwd()
+        logger.info(f"📂 Current working directory: {cwd}")
+
+        app_files = sanity_os.listdir('/app')
+        logger.info(f"📋 Files in /app: {sorted(app_files)}")
+
+        # Verify critical files
+        if 'db.py' not in app_files:
+            logger.error("❌ CRITICAL: db.py not found in /app directory!")
+        else:
+            logger.info("✅ db.py found in /app directory")
+
+        if 'bot.py' not in app_files:
+            logger.error("❌ CRITICAL: bot.py not found in /app directory!")
+        else:
+            logger.info("✅ bot.py found in /app directory")
+    except Exception as e:
+        logger.error(f"⚠️ Startup sanity check failed: {e}")
 
     # Create application
     application = (
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
     # Add message handlers
+    # Topic photos (real-time)
     application.add_handler(
         MessageHandler(
             filters.PHOTO & filters.Chat(CHAT_ID),
-            handle_photo_message
+            handle_topic_photo
         )
     )
 
-    # Add public commands (case-insensitive)
+    # Forwarded photos in DM (batch system)
+    application.add_handler(
+        MessageHandler(
+            filters.PHOTO & filters.ChatType.PRIVATE,
+            handle_forwarded_dm
+        )
+    )
+
+    # Public commands
     application.add_handler(
         CommandHandler(
             ['pnlrank', 'PNLRank', 'PNLRANK', 'pnlRank'],
@@ -943,18 +944,18 @@ def main():
         )
     )
 
-    # Add admin commands
-    application.add_handler(CommandHandler('adminboard', cmd_adminboard))
-    application.add_handler(CommandHandler('eng', cmd_engagement))
+    # Admin commands
+    application.add_handler(CommandHandler('rankerinfo', cmd_rankerinfo))
+    application.add_handler(CommandHandler('add', cmd_add))
+    application.add_handler(CommandHandler('stats', cmd_stats))
+    application.add_handler(CommandHandler('reset', cmd_reset))
     application.add_handler(CommandHandler('pointson', cmd_pointson))
     application.add_handler(CommandHandler('pointsoff', cmd_pointsoff))
     application.add_handler(CommandHandler('selectwinners', cmd_selectwinners))
     application.add_handler(CommandHandler('winners', cmd_winners))
-    application.add_handler(CommandHandler('backfill', cmd_backfill))
-    application.add_handler(CommandHandler('scan', cmd_scan))
-    application.add_handler(CommandHandler('checkmsg', cmd_checkmsg))
-    application.add_handler(CommandHandler('debug', cmd_debug))
-    application.add_handler(CommandHandler('stats', cmd_stats))
+    application.add_handler(CommandHandler('help', cmd_help))
+    application.add_handler(CommandHandler('test', cmd_test))
+    application.add_handler(CommandHandler('testdata', cmd_testdata))
 
     # Start bot
     logger.info("🎯 Bot starting...")

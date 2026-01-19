@@ -37,7 +37,7 @@ def get_default_submissions():
         "stats": {
             "total_participants": 0,
             "total_submissions": 0,
-            "campaign_start": format_timestamp(datetime(2025, 1, 15, 0, 1, tzinfo=IST)),
+            "campaign_start": format_timestamp(IST.localize(datetime(2025, 1, 15, 0, 1))),
             "last_updated": format_timestamp(datetime.now(IST))
         }
     }
@@ -52,8 +52,8 @@ def get_default_config():
     """Return default structure for config.json"""
     return {
         "show_points": True,
-        "campaign_start": format_timestamp(datetime(2025, 1, 15, 0, 1, tzinfo=IST)),
-        "campaign_end": format_timestamp(datetime(2025, 2, 11, 23, 59, 59, tzinfo=IST))
+        "campaign_start": format_timestamp(IST.localize(datetime(2025, 1, 15, 0, 1))),
+        "campaign_end": format_timestamp(IST.localize(datetime(2025, 2, 11, 23, 59, 59)))
     }
 
 
@@ -182,91 +182,12 @@ def save_config(data):
     save_json_atomic(CONFIG_FILE, data)
 
 
-def load_hashes():
-    """Load hashes.json"""
-    return load_json_safe(HASHES_FILE, get_default_hashes)
-
-
-def save_hashes(data):
-    """Save hashes.json"""
-    save_json_atomic(HASHES_FILE, data)
-
-
-def check_is_duplicate(user_id, photo_id, image_bytes_io=None):
-    """
-    Check if photo is a duplicate using global ID check AND perceptual hashing.
-    
-    Args:
-        user_id: Current user ID
-        photo_id: Telegram photo file_id
-        image_bytes_io: BytesIO object of downloaded image (optional)
-        
-    Returns:
-        tuple: (is_duplicate: bool, reason: str)
-    """
-    hashes_data = load_hashes()
-    
-    # 1. Global File ID Check
-    # If ANY user has uploaded this exact file ID before
-    # Note: We store IDs as dict keys for faster lookup if list gets huge, 
-    # but list is fine for <10k. Let's use list for simplicity as per existing pattern.
-    if photo_id in hashes_data['global_seen_ids']:
-        return True, "Global Duplicate (Same File)"
-        
-    # 2. Perceptual Hash Check
-    if image_bytes_io:
-        try:
-            img = Image.open(image_bytes_io)
-            # Calculate pHash
-            current_hash = imagehash.phash(img)
-            current_hex = str(current_hash)
-            
-            # Compare against DB
-            # Hamming distance threshold (0 = exact, <5 = very similar)
-            THRESHOLD = 5
-            
-            for stored_hex in hashes_data['phash_db'].keys():
-                stored_hash = imagehash.hex_to_hash(stored_hex)
-                distance = current_hash - stored_hash
-                
-                if distance < THRESHOLD:
-                    return True, f"Visual Duplicate (pHash match, dist={distance})"
-                    
-        except Exception as e:
-            logger.error(f"Error computing pHash: {e}")
-            
-    return False, None
-
-
-def register_new_photo(user_id, photo_id, image_bytes_io=None):
-    """Register a new photo in the global database"""
-    hashes_data = load_hashes()
-    
-    # Add ID
-    if photo_id not in hashes_data['global_seen_ids']:
-        hashes_data['global_seen_ids'].append(photo_id)
-        
-    # Add Hash
-    if image_bytes_io:
-        try:
-            img = Image.open(image_bytes_io)
-            h = str(imagehash.phash(img))
-            hashes_data['phash_db'][h] = {
-                'user_id': user_id,
-                'ts': format_timestamp(datetime.now(IST))
-            }
-        except Exception as e:
-            logger.error(f"Failed to save hash: {e}")
-            
-    save_hashes(hashes_data)
-
-
-
 def add_submission(user_id, username, full_name, message_id, photo_id, timestamp, week, image_bytes_io=None):
     """
-    Add a new submission to the database.
+    Add a new submission to the database (TIME-INDEPENDENT VERSION).
 
     This is an idempotent operation - if message_id already exists, it's skipped.
+    NO WEEK TRACKING - counts all photos regardless of date.
 
     Args:
         user_id: Telegram user ID
@@ -275,7 +196,6 @@ def add_submission(user_id, username, full_name, message_id, photo_id, timestamp
         message_id: Unique Telegram message ID
         photo_id: Telegram file_id for duplicate detection
         timestamp: datetime object
-        week: Week number (1-4)
 
     Returns:
         bool: True if submission was added, False if duplicate
@@ -291,8 +211,7 @@ def add_submission(user_id, username, full_name, message_id, photo_id, timestamp
             "first_seen": format_timestamp(timestamp),
             "unique_photos": [],
             "submissions": [],
-            "total_points": 0,
-            "weekly_points": {}
+            "total_points": 0
         }
         data['stats']['total_participants'] += 1
 
@@ -325,17 +244,14 @@ def add_submission(user_id, username, full_name, message_id, photo_id, timestamp
     user_data['submissions'].append({
         "message_id": message_id,
         "photo_id": photo_id,
-        "timestamp": format_timestamp(timestamp),
-        "week": week
+        "timestamp": format_timestamp(timestamp)
     })
 
     # Add photo to unique list
     user_data['unique_photos'].append(photo_id)
 
-    # Update points
+    # Update points (all-time cumulative)
     user_data['total_points'] += 1
-    week_str = str(week)
-    user_data['weekly_points'][week_str] = user_data['weekly_points'].get(week_str, 0) + 1
 
     # Update username/full_name if changed
     user_data['username'] = username or user_data['username']
@@ -346,29 +262,26 @@ def add_submission(user_id, username, full_name, message_id, photo_id, timestamp
 
     # Save atomically
     save_submissions(data)
-    logger.info(f"Added submission for user {user_id} (message {message_id}, week {week})")
+    logger.info(f"Added submission for user {user_id} (message {message_id})")
 
     return True
 
 
-def get_leaderboard(week=None):
+def get_leaderboard(limit=None):
     """
-    Get leaderboard for specific week or all-time.
+    Get all-time leaderboard (TIME-INDEPENDENT).
 
     Args:
-        week: Week number (1-4) or None for all-time
+        limit: Maximum number of entries to return (None for all)
 
     Returns:
-        list: Sorted list of (user_id, username, full_name, points)
+        list: Sorted list of dictionaries with user_id, username, full_name, points
     """
     data = load_submissions()
     leaderboard = []
 
     for user_id, user_data in data['users'].items():
-        if week is None:
-            points = user_data['total_points']
-        else:
-            points = user_data['weekly_points'].get(str(week), 0)
+        points = user_data['total_points']
 
         if points > 0:  # Only include users with points
             leaderboard.append({
@@ -381,6 +294,8 @@ def get_leaderboard(week=None):
     # Sort by points (descending), then by username (ascending)
     leaderboard.sort(key=lambda x: (-x['points'], x['username'].lower()))
 
+    if limit:
+        return leaderboard[:limit]
     return leaderboard
 
 
@@ -454,15 +369,8 @@ def get_engagement_stats(week=None):
     total_users = stats['total_participants']
     avg_posts = total_posts / total_users if total_users > 0 else 0
 
-    # Count new participants this week
+    # New participants this week - not tracked in time-independent mode
     new_this_week = 0
-    if week:
-        for user_id, user_data in data['users'].items():
-            if str(week) in user_data['weekly_points']:
-                # Check if this is their first week
-                weeks_participated = [w for w in user_data['weekly_points'].keys() if user_data['weekly_points'][w] > 0]
-                if len(weeks_participated) == 1 and str(week) in weeks_participated:
-                    new_this_week += 1
 
     # Calculate campaign day
     from datetime import datetime

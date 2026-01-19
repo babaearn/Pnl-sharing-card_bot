@@ -9,11 +9,8 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY bot.py .
-COPY data_manager.py .
-COPY leaderboard.py .
-COPY utils.py .
+# Copy all application files
+COPY . .
 
 # Create data directory with proper permissions
 # This ensures JSON files can be written during runtime

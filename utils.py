@@ -145,7 +145,7 @@ def parse_timestamp(timestamp_str):
 class SensitiveFormatter(logging.Formatter):
     """
     Custom log formatter that masks sensitive information.
-    Prevents bot tokens and user IDs from appearing in logs.
+    Prevents bot tokens, DATABASE_URL, and user IDs from appearing in logs.
     """
 
     def format(self, record):
@@ -154,6 +154,10 @@ class SensitiveFormatter(logging.Formatter):
 
         # Mask bot token (format: 1234567890:ABCdefGHIjklMNOpqrsTUVwxyz)
         message = re.sub(r'\d{10}:[A-Za-z0-9_-]{35}', '[BOT_TOKEN_MASKED]', message)
+
+        # Mask DATABASE_URL (postgresql://user:password@host/db)
+        message = re.sub(r'postgresql://[^\s]+', 'postgresql://***', message)
+        message = re.sub(r'postgres://[^\s]+', 'postgres://***', message)
 
         # Mask user IDs in various formats
         message = re.sub(r'user_id["\s:]+(\d{8,})', r'user_id: [MASKED]', message)
