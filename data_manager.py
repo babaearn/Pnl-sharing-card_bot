@@ -14,6 +14,9 @@ import logging
 from pathlib import Path
 from datetime import datetime
 from utils import IST, format_timestamp
+from io import BytesIO
+import imagehash
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +27,7 @@ DATA_DIR.mkdir(exist_ok=True)
 SUBMISSIONS_FILE = DATA_DIR / 'submissions.json'
 WINNERS_FILE = DATA_DIR / 'winners.json'
 CONFIG_FILE = DATA_DIR / 'config.json'
+HASHES_FILE = DATA_DIR / 'hashes.json'
 
 
 def get_default_submissions():
@@ -50,6 +54,14 @@ def get_default_config():
         "show_points": True,
         "campaign_start": format_timestamp(datetime(2025, 1, 15, 0, 1, tzinfo=IST)),
         "campaign_end": format_timestamp(datetime(2025, 2, 11, 23, 59, 59, tzinfo=IST))
+    }
+
+
+def get_default_hashes():
+    """Return default structure for hashes.json"""
+    return {
+        "global_seen_ids": [],
+        "phash_db": {}  # {hex_hash: [user_id, message_id, ...]}
     }
 
 
@@ -170,7 +182,87 @@ def save_config(data):
     save_json_atomic(CONFIG_FILE, data)
 
 
-def add_submission(user_id, username, full_name, message_id, photo_id, timestamp, week):
+def load_hashes():
+    """Load hashes.json"""
+    return load_json_safe(HASHES_FILE, get_default_hashes)
+
+
+def save_hashes(data):
+    """Save hashes.json"""
+    save_json_atomic(HASHES_FILE, data)
+
+
+def check_is_duplicate(user_id, photo_id, image_bytes_io=None):
+    """
+    Check if photo is a duplicate using global ID check AND perceptual hashing.
+    
+    Args:
+        user_id: Current user ID
+        photo_id: Telegram photo file_id
+        image_bytes_io: BytesIO object of downloaded image (optional)
+        
+    Returns:
+        tuple: (is_duplicate: bool, reason: str)
+    """
+    hashes_data = load_hashes()
+    
+    # 1. Global File ID Check
+    # If ANY user has uploaded this exact file ID before
+    # Note: We store IDs as dict keys for faster lookup if list gets huge, 
+    # but list is fine for <10k. Let's use list for simplicity as per existing pattern.
+    if photo_id in hashes_data['global_seen_ids']:
+        return True, "Global Duplicate (Same File)"
+        
+    # 2. Perceptual Hash Check
+    if image_bytes_io:
+        try:
+            img = Image.open(image_bytes_io)
+            # Calculate pHash
+            current_hash = imagehash.phash(img)
+            current_hex = str(current_hash)
+            
+            # Compare against DB
+            # Hamming distance threshold (0 = exact, <5 = very similar)
+            THRESHOLD = 5
+            
+            for stored_hex in hashes_data['phash_db'].keys():
+                stored_hash = imagehash.hex_to_hash(stored_hex)
+                distance = current_hash - stored_hash
+                
+                if distance < THRESHOLD:
+                    return True, f"Visual Duplicate (pHash match, dist={distance})"
+                    
+        except Exception as e:
+            logger.error(f"Error computing pHash: {e}")
+            
+    return False, None
+
+
+def register_new_photo(user_id, photo_id, image_bytes_io=None):
+    """Register a new photo in the global database"""
+    hashes_data = load_hashes()
+    
+    # Add ID
+    if photo_id not in hashes_data['global_seen_ids']:
+        hashes_data['global_seen_ids'].append(photo_id)
+        
+    # Add Hash
+    if image_bytes_io:
+        try:
+            img = Image.open(image_bytes_io)
+            h = str(imagehash.phash(img))
+            hashes_data['phash_db'][h] = {
+                'user_id': user_id,
+                'ts': format_timestamp(datetime.now(IST))
+            }
+        except Exception as e:
+            logger.error(f"Failed to save hash: {e}")
+            
+    save_hashes(hashes_data)
+
+
+
+def add_submission(user_id, username, full_name, message_id, photo_id, timestamp, week, image_bytes_io=None):
     """
     Add a new submission to the database.
 
@@ -212,10 +304,22 @@ def add_submission(user_id, username, full_name, message_id, photo_id, timestamp
         logger.debug(f"Message {message_id} already processed for user {user_id}")
         return False
 
-    # Check for duplicate photo
-    if photo_id in user_data['unique_photos']:
-        logger.info(f"Duplicate photo {photo_id} detected for user {user_id}, ignoring")
         return False
+
+    # Check for duplicate photo (User-specific check kept for legacy/speed)
+    if photo_id in user_data['unique_photos']:
+        logger.info(f"Duplicate photo {photo_id} detected for user {user_id} (User History), ignoring")
+        return False
+
+    # GLOBAL & PHASH CHECK
+    # Only run if we haven't already locally rejected it
+    is_dupe, reason = check_is_duplicate(user_id, photo_id, image_bytes_io)
+    if is_dupe:
+        logger.info(f"⛔ Fraud Detected: {reason} for user {user_id}")
+        return False
+
+    # Register in global DB
+    register_new_photo(user_id, photo_id, image_bytes_io)
 
     # Add new submission
     user_data['submissions'].append({

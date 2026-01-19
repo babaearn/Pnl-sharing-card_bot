@@ -16,6 +16,7 @@ import asyncio
 from datetime import datetime
 from functools import wraps
 import time
+import io
 
 from telegram import Update
 from telegram.ext import (
@@ -439,6 +440,18 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     logger.info(f"✅ Valid PnL card! User: {username}, Week: {week}, Msg: {message_id}")
 
+    # Download photo for pHash analysis
+    image_bytes_io = None
+    try:
+        # Get file object
+        photo_file = await message.photo[-1].get_file()
+        image_bytes_io = io.BytesIO()
+        await photo_file.download_to_memory(out=image_bytes_io)
+        image_bytes_io.seek(0)
+    except Exception as e:
+        logger.error(f"Failed to download photo {photo_id}: {e}")
+        # Continue without image (will slip pHash check but catch file ID check)
+
     # Add submission (idempotent - checks message_id and photo_id)
     added = add_submission(
         user_id=user_id,
@@ -447,7 +460,8 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         message_id=message_id,
         photo_id=photo_id,
         timestamp=timestamp,
-        week=week
+        week=week,
+        image_bytes_io=image_bytes_io
     )
 
     if added:
@@ -895,6 +909,12 @@ async def post_init(application: Application):
 
 def main():
     """Main entry point"""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     logger.info("🚀 Starting PnL Flex Challenge Leaderboard Bot...")
     logger.info(f"📍 Monitoring Chat: {CHAT_ID}, Topic: {TOPIC_ID}")
     logger.info(f"👨‍💼 Admins: {ADMIN_IDS}")
