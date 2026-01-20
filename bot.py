@@ -493,25 +493,40 @@ def format_leaderboard_entry(entry: Dict, show_points: bool) -> str:
 
 async def cmd_pnlrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /pnlrank - Show Top 5 leaderboard (case-insensitive).
+    /pnlrank - Show Top 10 leaderboard (case-insensitive).
 
+    Shows Top 5 with medals, then positions 6-10 plain (for encouragement).
     Auto-deletes bot response after 60 seconds (NOT the user's command).
     """
     # Get show_points setting
     show_points = await db.get_show_points()
 
-    # Get Top 5
-    leaderboard = await db.get_leaderboard(limit=5)
+    # Get Top 10 for encouragement
+    leaderboard = await db.get_leaderboard(limit=10)
 
     if not leaderboard:
         await update.message.reply_text("📊 No submissions yet!")
         return
 
     # Format leaderboard
-    lines = ["🏆 PnL Flex Challenge - Top 5\n"]
+    lines = ["🏆 PnL Flex Challenge - Top 10\n"]
 
-    for entry in leaderboard:
-        lines.append(format_leaderboard_entry(entry, show_points))
+    for idx, entry in enumerate(leaderboard, 1):
+        name = entry.get('display_name') or "Unknown"
+        points = entry.get('points', 0)
+
+        if idx <= 5:
+            # Top 5: Show with 🏅 medal
+            if show_points:
+                lines.append(f"🏅 {name} - {points} pts")
+            else:
+                lines.append(f"🏅 {name}")
+        else:
+            # Positions 6-10: Plain format (encouragement)
+            if show_points:
+                lines.append(f"{idx}. {name} - {points} pts")
+            else:
+                lines.append(f"{idx}. {name}")
 
     text = "\n".join(lines)
 
