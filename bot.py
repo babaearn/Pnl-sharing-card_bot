@@ -40,16 +40,19 @@ from utils import (
 )
 
 # Configure logging with sensitive data masking
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# Only configure if handlers haven't been set up yet (prevents duplicates)
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        level=logging.INFO
+    )
 
-# Apply sensitive formatter
+# Apply sensitive formatter to all handlers
 for handler in logging.getLogger().handlers:
-    handler.setFormatter(SensitiveFormatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    ))
+    if not isinstance(handler.formatter, SensitiveFormatter):
+        handler.setFormatter(SensitiveFormatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        ))
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
@@ -318,43 +321,15 @@ async def handle_topic_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Get photo file_id
     photo_file_id = message.photo[-1].file_id
 
-    # --- FRAUD DETECTION (pHash) ---
-    current_phash = None
     try:
-        # Download photo
-        photo_file = await message.photo[-1].get_file()
-        image_bytes_io = io.BytesIO()
-        await photo_file.download_to_memory(out=image_bytes_io)
-        image_bytes_io.seek(0)
-        
-        # Calculate Hash
-        img = Image.open(image_bytes_io)
-        current_hash = imagehash.phash(img)
-        current_phash = str(current_hash)
-        
-        # Check against existing hashes
-        existing_hashes = await db.get_all_hashes()
-        THRESHOLD = 5
-        
-        for stored_hex in existing_hashes:
-            stored_hash = imagehash.hex_to_hash(stored_hex)
-            if current_hash - stored_hash < THRESHOLD:
-                logger.info(f"⛔ Fraud Blocked: Visual duplicate detected for {full_name}")
-                return # Block silently or notify user? Silent is better to not spam.
-                
-    except Exception as e:
-        logger.error(f"Error in fraud check: {e}")
-        # Continue (fail open or closed? Fail open to allow submissions if check fails)
-
-    try:
-        # Get or create participant
+        # Get or create participant FIRST
         participant_id = await db.get_or_create_participant(
             tg_user_id=tg_user_id,
             username=username,
             full_name=full_name
         )
 
-        # Add submission
+        # Check file_id deduplication FIRST (fast, reliable)
         success, result = await db.add_submission(
             participant_id=participant_id,
             photo_file_id=photo_file_id,
@@ -362,13 +337,54 @@ async def handle_topic_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
             tg_message_id=message.message_id
         )
 
-        if success:
-            logger.info(f"✅✅ NEW SUBMISSION: {full_name} (@{username}) - photo {photo_file_id[:20]}...")
-            # Save hash
-            if current_phash:
-                await db.add_phash(participant_id, current_phash)
-        else:
+        if not success:
+            # Already submitted this exact file_id
             logger.info(f"⏭️ Duplicate ignored: {full_name} - photo already counted")
+            return
+
+        # --- FRAUD DETECTION (pHash) - AFTER file_id check ---
+        # NOTE: Disabled for template-based images (Mudrex PnL cards)
+        # Template images have similar perceptual hashes even when content differs
+        # Relying on file_id deduplication instead (more reliable for this use case)
+
+        ENABLE_PHASH_CHECK = False  # Set to True to enable visual similarity detection
+
+        if ENABLE_PHASH_CHECK:
+            current_phash = None
+            try:
+                # Download photo
+                photo_file = await message.photo[-1].get_file()
+                image_bytes_io = io.BytesIO()
+                await photo_file.download_to_memory(out=image_bytes_io)
+                image_bytes_io.seek(0)
+
+                # Calculate Hash
+                img = Image.open(image_bytes_io)
+                current_hash = imagehash.phash(img)
+                current_phash = str(current_hash)
+
+                # Check against existing hashes (increased threshold for template images)
+                existing_hashes = await db.get_all_hashes()
+                THRESHOLD = 15  # Increased from 5 to reduce false positives on template images
+
+                for stored_hex in existing_hashes:
+                    stored_hash = imagehash.hex_to_hash(stored_hex)
+                    distance = current_hash - stored_hash
+                    if distance < THRESHOLD:
+                        logger.warning(f"⚠️ Similar image detected: {full_name} (distance={distance}, threshold={THRESHOLD})")
+                        # Log but don't block (for monitoring)
+                        break
+
+                # Save hash for future monitoring
+                if current_phash:
+                    await db.add_phash(participant_id, current_phash)
+
+            except Exception as e:
+                logger.error(f"Error in pHash check: {e}")
+                # Continue even if pHash fails (fail-open)
+
+        # Success - photo accepted
+        logger.info(f"✅ NEW SUBMISSION: {full_name} (@{username}) - photo {photo_file_id[:20]}...")
 
     except Exception as e:
         logger.error(f"Failed to process topic photo: {e}")
