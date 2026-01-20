@@ -12,6 +12,9 @@ import asyncio
 from datetime import datetime
 from collections import defaultdict
 from typing import Optional, Dict
+import io
+import imagehash
+from PIL import Image
 
 from telegram import Update, MessageOriginUser, MessageOriginHiddenUser, MessageOriginChat, MessageOriginChannel
 from telegram.ext import (
@@ -315,6 +318,34 @@ async def handle_topic_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Get photo file_id
     photo_file_id = message.photo[-1].file_id
 
+    # --- FRAUD DETECTION (pHash) ---
+    current_phash = None
+    try:
+        # Download photo
+        photo_file = await message.photo[-1].get_file()
+        image_bytes_io = io.BytesIO()
+        await photo_file.download_to_memory(out=image_bytes_io)
+        image_bytes_io.seek(0)
+        
+        # Calculate Hash
+        img = Image.open(image_bytes_io)
+        current_hash = imagehash.phash(img)
+        current_phash = str(current_hash)
+        
+        # Check against existing hashes
+        existing_hashes = await db.get_all_hashes()
+        THRESHOLD = 5
+        
+        for stored_hex in existing_hashes:
+            stored_hash = imagehash.hex_to_hash(stored_hex)
+            if current_hash - stored_hash < THRESHOLD:
+                logger.info(f"⛔ Fraud Blocked: Visual duplicate detected for {full_name}")
+                return # Block silently or notify user? Silent is better to not spam.
+                
+    except Exception as e:
+        logger.error(f"Error in fraud check: {e}")
+        # Continue (fail open or closed? Fail open to allow submissions if check fails)
+
     try:
         # Get or create participant
         participant_id = await db.get_or_create_participant(
@@ -333,6 +364,9 @@ async def handle_topic_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         if success:
             logger.info(f"✅✅ NEW SUBMISSION: {full_name} (@{username}) - photo {photo_file_id[:20]}...")
+            # Save hash
+            if current_phash:
+                await db.add_phash(participant_id, current_phash)
         else:
             logger.info(f"⏭️ Duplicate ignored: {full_name} - photo already counted")
 
@@ -844,6 +878,12 @@ async def post_shutdown(application: Application):
 
 def main():
     """Main entry point."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     logger.info("🚀 Starting PnL Flex Challenge Bot (PostgreSQL Edition)...")
     logger.info(f"📍 Monitoring Chat: {CHAT_ID}, Topic: {TOPIC_ID}")
     logger.info(f"👨‍💼 Admins: {ADMIN_IDS}")

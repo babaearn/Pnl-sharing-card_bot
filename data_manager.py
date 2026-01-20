@@ -14,6 +14,9 @@ import logging
 from pathlib import Path
 from datetime import datetime
 from utils import IST, format_timestamp
+from io import BytesIO
+import imagehash
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +27,7 @@ DATA_DIR.mkdir(exist_ok=True)
 SUBMISSIONS_FILE = DATA_DIR / 'submissions.json'
 WINNERS_FILE = DATA_DIR / 'winners.json'
 CONFIG_FILE = DATA_DIR / 'config.json'
+HASHES_FILE = DATA_DIR / 'hashes.json'
 
 
 def get_default_submissions():
@@ -50,6 +54,14 @@ def get_default_config():
         "show_points": True,
         "campaign_start": format_timestamp(IST.localize(datetime(2025, 1, 15, 0, 1))),
         "campaign_end": format_timestamp(IST.localize(datetime(2025, 2, 11, 23, 59, 59)))
+    }
+
+
+def get_default_hashes():
+    """Return default structure for hashes.json"""
+    return {
+        "global_seen_ids": [],
+        "phash_db": {}  # {hex_hash: [user_id, message_id, ...]}
     }
 
 
@@ -170,7 +182,7 @@ def save_config(data):
     save_json_atomic(CONFIG_FILE, data)
 
 
-def add_submission(user_id, username, full_name, message_id, photo_id, timestamp):
+def add_submission(user_id, username, full_name, message_id, photo_id, timestamp, week, image_bytes_io=None):
     """
     Add a new submission to the database (TIME-INDEPENDENT VERSION).
 
@@ -211,10 +223,22 @@ def add_submission(user_id, username, full_name, message_id, photo_id, timestamp
         logger.debug(f"Message {message_id} already processed for user {user_id}")
         return False
 
-    # Check for duplicate photo
-    if photo_id in user_data['unique_photos']:
-        logger.info(f"Duplicate photo {photo_id} detected for user {user_id}, ignoring")
         return False
+
+    # Check for duplicate photo (User-specific check kept for legacy/speed)
+    if photo_id in user_data['unique_photos']:
+        logger.info(f"Duplicate photo {photo_id} detected for user {user_id} (User History), ignoring")
+        return False
+
+    # GLOBAL & PHASH CHECK
+    # Only run if we haven't already locally rejected it
+    is_dupe, reason = check_is_duplicate(user_id, photo_id, image_bytes_io)
+    if is_dupe:
+        logger.info(f"⛔ Fraud Detected: {reason} for user {user_id}")
+        return False
+
+    # Register in global DB
+    register_new_photo(user_id, photo_id, image_bytes_io)
 
     # Add new submission
     user_data['submissions'].append({

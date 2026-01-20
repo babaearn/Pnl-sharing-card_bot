@@ -138,6 +138,16 @@ async def create_tables():
             )
         ''')
 
+        # Photo Hashes table (for fraud detection)
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS photo_hashes (
+                id SERIAL PRIMARY KEY,
+                participant_id INT REFERENCES participants(id) ON DELETE SET NULL,
+                phash TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        ''')
+
         logger.info("✅ All tables created/verified")
 
 
@@ -617,3 +627,23 @@ async def test_transaction() -> Tuple[bool, float]:
             return (False, 0)
 
     return (False, 0)
+
+
+# ============================================================================
+# FRAUD DETECTION OPERATIONS
+# ============================================================================
+
+async def get_all_hashes() -> List[str]:
+    """Get all perceptual hashes for fraud detection."""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch('SELECT phash FROM photo_hashes')
+        return [row['phash'] for row in rows]
+
+
+async def add_phash(participant_id: int, phash: str):
+    """Add perceptual hash for a submission."""
+    async with _pool.acquire() as conn:
+        await conn.execute('''
+            INSERT INTO photo_hashes (participant_id, phash)
+            VALUES ($1, $2)
+        ''', participant_id, phash)
