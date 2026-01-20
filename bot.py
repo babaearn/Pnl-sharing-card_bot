@@ -511,6 +511,15 @@ async def cmd_pnlrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Format leaderboard
     lines = ["🏆 PnL Flex Challenge - Top 10\n"]
 
+    # Emoji numbers for positions 6-10
+    emoji_numbers = {
+        6: "6️⃣",
+        7: "7️⃣",
+        8: "8️⃣",
+        9: "9️⃣",
+        10: "🔟"
+    }
+
     for idx, entry in enumerate(leaderboard, 1):
         name = entry.get('display_name') or "Unknown"
         points = entry.get('points', 0)
@@ -522,11 +531,12 @@ async def cmd_pnlrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 lines.append(f"🏅 {name}")
         else:
-            # Positions 6-10: Plain format (encouragement)
+            # Positions 6-10: Emoji numbers (no space after emoji)
+            emoji = emoji_numbers.get(idx, f"{idx}.")
             if show_points:
-                lines.append(f"{idx}. {name} - {points} pts")
+                lines.append(f"{emoji}{name} - {points} pts")
             else:
-                lines.append(f"{idx}. {name}")
+                lines.append(f"{emoji}{name}")
 
     text = "\n".join(lines)
 
@@ -610,6 +620,39 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if success:
         await update.message.reply_text(f"✅ Adjustment applied\n\n{message}\nNew total: {new_points} pts")
+    else:
+        await update.message.reply_text(f"❌ {message}")
+
+
+@admin_only
+@dm_only
+async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /remove #01 - Remove a participant and all their submissions.
+
+    Deletes participant from leaderboard completely.
+    Use this to remove duplicates or invalid entries.
+    """
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "Usage: /remove #01\n"
+            "Example: /remove #01 (removes participant #01)"
+        )
+        return
+
+    participant_code = context.args[0]
+
+    # Confirmation check
+    if not participant_code.startswith('#'):
+        await update.message.reply_text("❌ Code must start with # (e.g., #01)")
+        return
+
+    # Perform deletion
+    success, message = await db.delete_participant(participant_code)
+
+    if success:
+        await update.message.reply_text(f"✅ {message}")
+        logger.info(f"Admin {update.effective_user.id} removed participant {participant_code}")
     else:
         await update.message.reply_text(f"❌ {message}")
 
@@ -790,6 +833,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 **Manual Adjustments:**
 /add #01 5 - Add points
 /add #01 -3 - Remove points
+/remove #01 - Delete participant & submissions
 
 **Settings:**
 /pointson - Show points in public leaderboard
@@ -978,6 +1022,7 @@ def main():
     # Admin commands
     application.add_handler(CommandHandler('rankerinfo', cmd_rankerinfo))
     application.add_handler(CommandHandler('add', cmd_add))
+    application.add_handler(CommandHandler('remove', cmd_remove))
     application.add_handler(CommandHandler('stats', cmd_stats))
     application.add_handler(CommandHandler('reset', cmd_reset))
     application.add_handler(CommandHandler('pointson', cmd_pointson))

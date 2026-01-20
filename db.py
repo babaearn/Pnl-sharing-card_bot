@@ -349,6 +349,54 @@ async def add_submission(
                 return (False, "duplicate")
 
 
+async def delete_participant(code: str) -> Tuple[bool, str]:
+    """
+    Delete a participant and all their submissions by code.
+
+    Args:
+        code: Participant code (e.g., '#01')
+
+    Returns:
+        Tuple of (success: bool, message: str)
+    """
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            # Check if participant exists
+            participant = await conn.fetchrow('''
+                SELECT id, display_name, points FROM participants WHERE code = $1
+            ''', code)
+
+            if not participant:
+                return (False, f"Participant {code} not found")
+
+            participant_id = participant['id']
+            display_name = participant['display_name']
+            points = participant['points']
+
+            # Delete submissions (cascades due to FK)
+            deleted_submissions = await conn.execute('''
+                DELETE FROM submissions WHERE participant_id = $1
+            ''', participant_id)
+
+            # Delete adjustments (cascades due to FK)
+            await conn.execute('''
+                DELETE FROM adjustments WHERE participant_id = $1
+            ''', participant_id)
+
+            # Delete photo hashes (cascades due to FK)
+            await conn.execute('''
+                DELETE FROM photo_hashes WHERE participant_id = $1
+            ''', participant_id)
+
+            # Delete participant
+            await conn.execute('''
+                DELETE FROM participants WHERE id = $1
+            ''', participant_id)
+
+            logger.info(f"🗑️ Deleted participant {code} ({display_name}) with {points} points")
+            return (True, f"Deleted {code} ({display_name}) - {points} pts removed")
+
+
 # ============================================================================
 # LEADERBOARD OPERATIONS
 # ============================================================================
