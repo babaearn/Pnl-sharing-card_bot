@@ -566,15 +566,15 @@ async def cmd_pnlrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @dm_only
 async def cmd_rankerinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /rankerinfo - Show Top 10 with full verification details.
+    /rankerinfo - Show ALL participants with full verification details.
     """
-    rankers = await db.get_full_rankerinfo(limit=10)
+    rankers = await db.get_full_rankerinfo(limit=None)
 
     if not rankers:
         await update.message.reply_text("📊 No participants yet!")
         return
 
-    lines = ["🔐 Ranker Info - Top 10\n"]
+    lines = ["🔐 Ranker Info - ALL Participants\n"]
 
     for entry in rankers:
         code = entry['code']
