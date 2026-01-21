@@ -569,6 +569,8 @@ async def cmd_rankerinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /rankerinfo - Show ALL participants with full verification details.
     """
     rankers = await db.get_full_rankerinfo(limit=None)
+    total_participants = await db.get_total_participants()
+    total_submissions = await db.get_total_submissions()
 
     if not rankers:
         await update.message.reply_text("📊 No participants yet!")
@@ -583,6 +585,11 @@ async def cmd_rankerinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         points = entry['points']
 
         lines.append(f"{code} | {name} | {tg_id} | {points} pts")
+
+    # Add statistics at the bottom
+    lines.append("")
+    lines.append(f"📊 Total Participants: {total_participants}")
+    lines.append(f"📝 Total Submissions: {total_submissions}")
 
     await update.message.reply_text("\n".join(lines))
 

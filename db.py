@@ -433,6 +433,20 @@ async def get_full_rankerinfo(limit: int = 10) -> List[Dict]:
         return [dict(row) for row in rows]
 
 
+async def get_total_participants() -> int:
+    """Get total number of participants."""
+    async with _pool.acquire() as conn:
+        result = await conn.fetchval('SELECT COUNT(*) FROM participants')
+        return result or 0
+
+
+async def get_total_submissions() -> int:
+    """Get total number of submissions."""
+    async with _pool.acquire() as conn:
+        result = await conn.fetchval('SELECT COUNT(*) FROM submissions')
+        return result or 0
+
+
 # ============================================================================
 # ADJUSTMENT OPERATIONS
 # ============================================================================
