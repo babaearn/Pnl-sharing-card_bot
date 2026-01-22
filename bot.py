@@ -502,18 +502,19 @@ async def cmd_pnlrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Get show_points setting
     show_points = await db.get_show_points()
 
-    # Get current week
+    # Get current week and label
     current_week = await db.get_current_week()
+    week_label = await db.get_week_label()
 
     # Get Top 10 for current week only
     leaderboard = await db.get_leaderboard(limit=10, week=current_week)
 
     if not leaderboard:
-        await update.message.reply_text(f"📊 No submissions yet for Week {current_week}!")
+        await update.message.reply_text(f"📊 No submissions yet for {week_label}!")
         return
 
     # Format leaderboard
-    lines = [f"🏆 PnL Flex Challenge - Week {current_week} Top 10\n"]
+    lines = [f"🏆 PnL Flex Challenge - {week_label} Top 10\n"]
 
     # Emoji numbers for positions 6-10
     emoji_numbers = {
@@ -591,6 +592,7 @@ async def cmd_rankerinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_participants = await db.get_total_participants()
     total_submissions = await db.get_total_submissions()
     current_week = await db.get_current_week()
+    week_label = await db.get_week_label()
 
     if not rankers:
         if week:
@@ -618,9 +620,9 @@ async def cmd_rankerinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("")
     if week:
         lines.append(f"📅 Showing Week {week} data")
-        lines.append(f"📅 Current Week: {current_week}")
+        lines.append(f"📅 Current: {week_label} (Week {current_week})")
     else:
-        lines.append(f"📅 Current Week: {current_week}")
+        lines.append(f"📅 Current: {week_label} (Week {current_week})")
         lines.append(f"📊 Total Participants: {total_participants}")
         lines.append(f"📝 Total Submissions: {total_submissions}")
 
@@ -631,35 +633,66 @@ async def cmd_rankerinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @dm_only
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /add #01 5 - Add/remove points manually.
+    /add #01 5 - Add/remove points (cumulative)
+    /add #01 week2 5 - Add/remove points for specific week
 
     Delta can be positive or negative.
+    Week-specific adjustments only affect that week's leaderboard.
     """
-    if len(context.args) != 2:
+    if len(context.args) not in [2, 3]:
         await update.message.reply_text(
-            "Usage: /add #01 5\n"
-            "Example: /add #01 5 (add 5 points)\n"
-            "Example: /add #01 -3 (remove 3 points)"
+            "Usage:\n"
+            "/add #01 5 - Add 5 cumulative points\n"
+            "/add #01 -3 - Remove 3 cumulative points\n"
+            "/add #01 week2 5 - Add 5 points to week2\n"
+            "/add #01 week 3 10 - Add 10 points to week 3"
         )
         return
 
     participant_code = context.args[0]
-    try:
-        delta = int(context.args[1])
-    except ValueError:
-        await update.message.reply_text("❌ Delta must be a number")
-        return
+    week_number = None
+
+    if len(context.args) == 2:
+        # /add #01 5 (cumulative)
+        try:
+            delta = int(context.args[1])
+        except ValueError:
+            await update.message.reply_text("❌ Delta must be a number")
+            return
+    else:
+        # /add #01 week2 5 (week-specific)
+        # Parse week number from context.args[1]
+        week_str = context.args[1]
+
+        # Extract number from week string (e.g., "week2" -> 2, "2" -> 2)
+        import re
+        match = re.search(r'\d+', week_str)
+        if not match:
+            await update.message.reply_text("❌ Week must contain a number (e.g., week2, 2)")
+            return
+
+        week_number = int(match.group())
+
+        try:
+            delta = int(context.args[2])
+        except ValueError:
+            await update.message.reply_text("❌ Delta must be a number")
+            return
 
     # Perform adjustment
     success, message, new_points = await db.add_adjustment(
         participant_code=participant_code,
         delta=delta,
         admin_tg_user_id=update.effective_user.id,
-        note=f"Manual adjustment by admin {update.effective_user.id}"
+        note=f"Manual adjustment by admin {update.effective_user.id}",
+        week_number=week_number
     )
 
     if success:
-        await update.message.reply_text(f"✅ Adjustment applied\n\n{message}\nNew total: {new_points} pts")
+        if new_points is not None:
+            await update.message.reply_text(f"✅ Adjustment applied\n\n{message}\nNew total: {new_points} pts")
+        else:
+            await update.message.reply_text(f"✅ Adjustment applied\n\n{message}")
     else:
         await update.message.reply_text(f"❌ {message}")
 
@@ -702,29 +735,35 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /new - Start a new week (resets leaderboard but keeps all history).
+    /new week2 - Start new week with custom label "week2"
+    /new week 3 - Start new week with custom label "week 3"
 
     This command:
     - Increments week counter
+    - Sets custom label for the week
     - Future submissions count toward new week
     - All historical data is preserved
     - Use /rankerinfo <week> to view past weeks
     """
-    # Get current week before starting new one
-    old_week, new_week = await db.start_new_week()
+    # Get label from arguments (join all args with spaces)
+    label = " ".join(context.args) if context.args else None
+
+    # Start new week with optional label
+    old_label, new_label, old_week, new_week = await db.start_new_week(label)
 
     message = (
         f"📅 New Week Started!\n\n"
-        f"✅ Week {old_week} has ended\n"
-        f"✅ Week {new_week} has begun\n\n"
+        f"✅ {old_label} has ended\n"
+        f"✅ {new_label} has begun\n\n"
         f"All historical data preserved:\n"
         f"• Use /rankerinfo to see cumulative stats\n"
-        f"• Use /rankerinfo {old_week} to see Week {old_week}\n"
-        f"• Use /rankerinfo {new_week} to see Week {new_week}\n\n"
-        f"New submissions will count toward Week {new_week}!"
+        f"• Use /rankerinfo {old_week} to see {old_label}\n"
+        f"• Use /rankerinfo {new_week} to see {new_label}\n\n"
+        f"New submissions will count toward {new_label}!"
     )
 
     await update.message.reply_text(message)
-    logger.info(f"Admin {update.effective_user.id} started Week {new_week}")
+    logger.info(f"Admin {update.effective_user.id} started {new_label} (Week {new_week})")
 
 
 @admin_only
@@ -903,12 +942,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /stats - Engagement statistics
 
 **Manual Adjustments:**
-/add #01 5 - Add points
-/add #01 -3 - Remove points
+/add #01 5 - Add 5 cumulative points
+/add #01 -3 - Remove 3 cumulative points
+/add #01 week2 5 - Add 5 points to week2
+/add #01 week 3 10 - Add 10 points to week 3
 /remove #01 - Delete participant & submissions
 
 **Weekly Management:**
-/new - Start new week (keeps all history)
+/new - Start new week (auto-numbered)
+/new week2 - Start "week2" (custom label)
+/new week 3 - Start "week 3" (custom label)
 
 **Settings:**
 /pointson - Show points in public leaderboard

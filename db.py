@@ -128,8 +128,22 @@ async def create_tables():
                 delta INT NOT NULL,
                 admin_tg_user_id BIGINT NOT NULL,
                 note TEXT NULL,
+                week_number INT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
+        ''')
+
+        # Add week_number column if it doesn't exist (migration)
+        await conn.execute('''
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='adjustments' AND column_name='week_number'
+                ) THEN
+                    ALTER TABLE adjustments ADD COLUMN week_number INT NULL;
+                END IF;
+            END $$;
         ''')
 
         # Settings table (key-value store)
@@ -174,7 +188,8 @@ async def initialize_settings():
         'since_reset_duplicates': '0',
         'since_reset_manual_adjustments': '0',
         'reset_at': datetime.now(IST).isoformat(),
-        'current_week': '1'
+        'current_week': '1',
+        'week_label': 'Week 1'
     }
 
     async with _pool.acquire() as conn:
@@ -442,18 +457,19 @@ async def get_leaderboard(limit: int = 5, week: Optional[int] = None) -> List[Di
                 LIMIT $1
             ''', limit)
         else:
-            # Weekly points (count submissions for specific week)
+            # Weekly points (count submissions + adjustments for specific week)
             rows = await conn.fetch('''
                 SELECT
                     p.code,
                     p.display_name,
                     p.tg_user_id,
                     p.username,
-                    COUNT(s.id) as points
+                    (COUNT(s.id) + COALESCE(SUM(a.delta), 0))::int as points
                 FROM participants p
                 LEFT JOIN submissions s ON p.id = s.participant_id AND s.week_number = $1
+                LEFT JOIN adjustments a ON p.id = a.participant_id AND a.week_number = $1
                 GROUP BY p.id, p.code, p.display_name, p.tg_user_id, p.username
-                HAVING COUNT(s.id) > 0
+                HAVING (COUNT(s.id) + COALESCE(SUM(a.delta), 0)) > 0
                 ORDER BY points DESC, p.first_seen ASC
                 LIMIT $2
             ''', week, limit)
@@ -491,7 +507,7 @@ async def get_full_rankerinfo(limit: Optional[int] = 10, week: Optional[int] = N
                     LIMIT $1
                 ''', limit)
         else:
-            # Weekly points (count submissions for specific week)
+            # Weekly points (count submissions + adjustments for specific week)
             if limit is None:
                 rows = await conn.fetch('''
                     SELECT
@@ -500,11 +516,12 @@ async def get_full_rankerinfo(limit: Optional[int] = 10, week: Optional[int] = N
                         p.display_name,
                         p.tg_user_id,
                         p.username,
-                        COUNT(s.id) as points
+                        (COUNT(s.id) + COALESCE(SUM(a.delta), 0))::int as points
                     FROM participants p
                     LEFT JOIN submissions s ON p.id = s.participant_id AND s.week_number = $1
+                    LEFT JOIN adjustments a ON p.id = a.participant_id AND a.week_number = $1
                     GROUP BY p.id, p.code, p.display_name, p.tg_user_id, p.username
-                    HAVING COUNT(s.id) > 0
+                    HAVING (COUNT(s.id) + COALESCE(SUM(a.delta), 0)) > 0
                     ORDER BY points DESC, p.first_seen ASC
                 ''', week)
             else:
@@ -515,11 +532,12 @@ async def get_full_rankerinfo(limit: Optional[int] = 10, week: Optional[int] = N
                         p.display_name,
                         p.tg_user_id,
                         p.username,
-                        COUNT(s.id) as points
+                        (COUNT(s.id) + COALESCE(SUM(a.delta), 0))::int as points
                     FROM participants p
                     LEFT JOIN submissions s ON p.id = s.participant_id AND s.week_number = $1
+                    LEFT JOIN adjustments a ON p.id = a.participant_id AND a.week_number = $1
                     GROUP BY p.id, p.code, p.display_name, p.tg_user_id, p.username
-                    HAVING COUNT(s.id) > 0
+                    HAVING (COUNT(s.id) + COALESCE(SUM(a.delta), 0)) > 0
                     ORDER BY points DESC, p.first_seen ASC
                     LIMIT $2
                 ''', week, limit)
@@ -548,28 +566,52 @@ async def get_current_week() -> int:
         return int(result) if result else 1
 
 
-async def start_new_week() -> Tuple[int, int]:
+async def get_week_label() -> str:
+    """Get current week label."""
+    async with _pool.acquire() as conn:
+        result = await conn.fetchval("SELECT value FROM settings WHERE key = 'week_label'")
+        return result or "Week 1"
+
+
+async def start_new_week(label: Optional[str] = None) -> Tuple[str, str, int, int]:
     """
     Start a new week by incrementing the week counter.
     Does NOT delete any data - all history is preserved.
 
+    Args:
+        label: Optional custom label for the new week (e.g., "week2", "week 3")
+
     Returns:
-        Tuple[int, int]: (old_week, new_week)
+        Tuple[str, str, int, int]: (old_label, new_label, old_week, new_week)
     """
     async with _pool.acquire() as conn:
         async with conn.transaction():
-            # Get current week
+            # Get current week and label
             old_week = await conn.fetchval("SELECT value FROM settings WHERE key = 'current_week'")
             old_week = int(old_week) if old_week else 1
 
+            old_label = await conn.fetchval("SELECT value FROM settings WHERE key = 'week_label'")
+            old_label = old_label or f"Week {old_week}"
+
             # Increment to new week
             new_week = old_week + 1
+
+            # Set new label (use provided label or default)
+            if label:
+                new_label = label
+            else:
+                new_label = f"Week {new_week}"
+
             await conn.execute('''
                 UPDATE settings SET value = $1 WHERE key = 'current_week'
             ''', str(new_week))
 
-            logger.info(f"📅 Started new week: Week {old_week} → Week {new_week}")
-            return (old_week, new_week)
+            await conn.execute('''
+                UPDATE settings SET value = $1 WHERE key = 'week_label'
+            ''', new_label)
+
+            logger.info(f"📅 Started new week: {old_label} → {new_label} (Week {old_week} → Week {new_week})")
+            return (old_label, new_label, old_week, new_week)
 
 
 # ============================================================================
@@ -580,10 +622,18 @@ async def add_adjustment(
     participant_code: str,
     delta: int,
     admin_tg_user_id: int,
-    note: Optional[str] = None
+    note: Optional[str] = None,
+    week_number: Optional[int] = None
 ) -> Tuple[bool, str, Optional[int]]:
     """
     Add manual point adjustment.
+
+    Args:
+        participant_code: Participant code (e.g., '#01')
+        delta: Points to add (positive) or remove (negative)
+        admin_tg_user_id: Admin's Telegram user ID
+        note: Optional note about the adjustment
+        week_number: Optional week number for week-specific adjustment
 
     Returns:
         Tuple[bool, str, Optional[int]]: (success, message, new_points)
@@ -602,20 +652,35 @@ async def add_adjustment(
             current_points = row['points']
             display_name = row['display_name']
 
-            # Calculate new points (don't go below 0)
-            new_points = max(0, current_points + delta)
+            if week_number is None:
+                # Cumulative adjustment - modify cumulative points
+                new_points = max(0, current_points + delta)
 
-            # Update points
-            await conn.execute('''
-                UPDATE participants SET points = $1, updated_at = now()
-                WHERE id = $2
-            ''', new_points, participant_id)
+                # Update points
+                await conn.execute('''
+                    UPDATE participants SET points = $1, updated_at = now()
+                    WHERE id = $2
+                ''', new_points, participant_id)
 
-            # Record adjustment
-            await conn.execute('''
-                INSERT INTO adjustments (participant_id, delta, admin_tg_user_id, note)
-                VALUES ($1, $2, $3, $4)
-            ''', participant_id, delta, admin_tg_user_id, note)
+                # Record adjustment (no week_number)
+                await conn.execute('''
+                    INSERT INTO adjustments (participant_id, delta, admin_tg_user_id, note, week_number)
+                    VALUES ($1, $2, $3, $4, NULL)
+                ''', participant_id, delta, admin_tg_user_id, note)
+
+                logger.info(f"✅ Cumulative adjustment: {participant_code} {delta:+d} by admin {admin_tg_user_id}")
+                message = f"{display_name}: {current_points} → {new_points} (cumulative)"
+            else:
+                # Week-specific adjustment - only records for that week (doesn't modify cumulative)
+                # Record adjustment with week_number
+                await conn.execute('''
+                    INSERT INTO adjustments (participant_id, delta, admin_tg_user_id, note, week_number)
+                    VALUES ($1, $2, $3, $4, $5)
+                ''', participant_id, delta, admin_tg_user_id, note, week_number)
+
+                logger.info(f"✅ Week {week_number} adjustment: {participant_code} {delta:+d} by admin {admin_tg_user_id}")
+                message = f"{display_name}: {delta:+d} pts for week {week_number}"
+                new_points = None  # No cumulative change
 
             # Increment manual adjustments counter
             await conn.execute('''
@@ -623,9 +688,7 @@ async def add_adjustment(
                 WHERE key = 'since_reset_manual_adjustments'
             ''')
 
-            logger.info(f"✅ Adjustment: {participant_code} {delta:+d} by admin {admin_tg_user_id}")
-
-            return (True, f"{display_name}: {current_points} → {new_points}", new_points)
+            return (True, message, new_points)
 
 
 # ============================================================================
