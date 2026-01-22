@@ -634,7 +634,9 @@ async def cmd_rankerinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /add #01 5 - Add/remove points (cumulative)
-    /add #01 week2 5 - Add/remove points for specific week
+    /add #01 current 5 - Add/remove points for current week
+    /add #01 week2 5 - Add/remove points for week labeled "week2"
+    /add #01 4 5 - Add/remove points for week number 4
 
     Delta can be positive or negative.
     Week-specific adjustments only affect that week's leaderboard.
@@ -644,8 +646,9 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Usage:\n"
             "/add #01 5 - Add 5 cumulative points\n"
             "/add #01 -3 - Remove 3 cumulative points\n"
-            "/add #01 week2 5 - Add 5 points to week2\n"
-            "/add #01 week 3 10 - Add 10 points to week 3"
+            "/add #01 current 5 - Add 5 to current week\n"
+            "/add #01 week2 5 - Add 5 to week labeled 'week2'\n"
+            "/add #01 4 5 - Add 5 to week number 4"
         )
         return
 
@@ -660,18 +663,32 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Delta must be a number")
             return
     else:
-        # /add #01 week2 5 (week-specific)
-        # Parse week number from context.args[1]
+        # /add #01 week2 5 or /add #01 current 5 or /add #01 4 5 (week-specific)
         week_str = context.args[1]
 
-        # Extract number from week string (e.g., "week2" -> 2, "2" -> 2)
-        import re
-        match = re.search(r'\d+', week_str)
-        if not match:
-            await update.message.reply_text("❌ Week must contain a number (e.g., week2, 2)")
-            return
+        # Check if it's "current"
+        if week_str.lower() == "current":
+            week_number = await db.get_current_week()
+            week_label = await db.get_week_label()
+        else:
+            # Check if week_str matches current week label
+            current_week_label = await db.get_week_label()
+            current_week_number = await db.get_current_week()
 
-        week_number = int(match.group())
+            if week_str.lower() == current_week_label.lower():
+                # Matches current week label, use current week number
+                week_number = current_week_number
+                week_label = current_week_label
+            else:
+                # Extract number from week string (e.g., "week2" -> 2, "2" -> 2, "week 3" -> 3)
+                import re
+                match = re.search(r'\d+', week_str)
+                if not match:
+                    await update.message.reply_text("❌ Week must be 'current', match current label, or contain a number")
+                    return
+
+                week_number = int(match.group())
+                week_label = f"Week {week_number}"
 
         try:
             delta = int(context.args[2])
@@ -944,8 +961,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 **Manual Adjustments:**
 /add #01 5 - Add 5 cumulative points
 /add #01 -3 - Remove 3 cumulative points
-/add #01 week2 5 - Add 5 points to week2
-/add #01 week 3 10 - Add 10 points to week 3
+/add #01 current 5 - Add 5 to current week
+/add #01 week2 5 - Add 5 to week labeled "week2"
+/add #01 4 5 - Add 5 to week number 4
 /remove #01 - Delete participant & submissions
 
 **Weekly Management:**
