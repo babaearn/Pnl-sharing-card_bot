@@ -493,23 +493,27 @@ def format_leaderboard_entry(entry: Dict, show_points: bool) -> str:
 
 async def cmd_pnlrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /pnlrank - Show Top 10 leaderboard (case-insensitive).
+    /pnlrank - Show Top 10 leaderboard for CURRENT WEEK ONLY (case-insensitive).
 
     Shows Top 5 with medals, then positions 6-10 plain (for encouragement).
     Auto-deletes bot response after 60 seconds (NOT the user's command).
+    Resets to 0 each week when /new is run.
     """
     # Get show_points setting
     show_points = await db.get_show_points()
 
-    # Get Top 10 for encouragement
-    leaderboard = await db.get_leaderboard(limit=10)
+    # Get current week
+    current_week = await db.get_current_week()
+
+    # Get Top 10 for current week only
+    leaderboard = await db.get_leaderboard(limit=10, week=current_week)
 
     if not leaderboard:
-        await update.message.reply_text("📊 No submissions yet!")
+        await update.message.reply_text(f"📊 No submissions yet for Week {current_week}!")
         return
 
     # Format leaderboard
-    lines = ["🏆 PnL Flex Challenge - Top 10\n"]
+    lines = [f"🏆 PnL Flex Challenge - Week {current_week} Top 10\n"]
 
     # Emoji numbers for positions 6-10
     emoji_numbers = {

@@ -421,20 +421,42 @@ async def delete_participant(code: str) -> Tuple[bool, str]:
 # LEADERBOARD OPERATIONS
 # ============================================================================
 
-async def get_leaderboard(limit: int = 5) -> List[Dict]:
+async def get_leaderboard(limit: int = 5, week: Optional[int] = None) -> List[Dict]:
     """
-    Get top participants sorted by points (all-time).
+    Get top participants sorted by points.
+
+    Args:
+        limit: Maximum number of participants to return
+        week: Week number to filter by (None = cumulative/all-time)
 
     Returns list of dicts with: code, display_name, tg_user_id, points
     """
     async with _pool.acquire() as conn:
-        rows = await conn.fetch('''
-            SELECT code, display_name, tg_user_id, username, points
-            FROM participants
-            WHERE points > 0
-            ORDER BY points DESC, first_seen ASC
-            LIMIT $1
-        ''', limit)
+        if week is None:
+            # Cumulative (all-time) points
+            rows = await conn.fetch('''
+                SELECT code, display_name, tg_user_id, username, points
+                FROM participants
+                WHERE points > 0
+                ORDER BY points DESC, first_seen ASC
+                LIMIT $1
+            ''', limit)
+        else:
+            # Weekly points (count submissions for specific week)
+            rows = await conn.fetch('''
+                SELECT
+                    p.code,
+                    p.display_name,
+                    p.tg_user_id,
+                    p.username,
+                    COUNT(s.id) as points
+                FROM participants p
+                LEFT JOIN submissions s ON p.id = s.participant_id AND s.week_number = $1
+                GROUP BY p.id, p.code, p.display_name, p.tg_user_id, p.username
+                HAVING COUNT(s.id) > 0
+                ORDER BY points DESC, p.first_seen ASC
+                LIMIT $2
+            ''', week, limit)
 
         return [dict(row) for row in rows]
 
