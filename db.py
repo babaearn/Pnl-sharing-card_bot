@@ -95,9 +95,23 @@ async def create_tables():
                 photo_file_id TEXT NOT NULL,
                 source TEXT NOT NULL CHECK (source IN ('topic', 'forward', 'manual')),
                 tg_message_id BIGINT NULL,
+                week_number INT NOT NULL DEFAULT 1,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 UNIQUE (participant_id, photo_file_id)
             )
+        ''')
+
+        # Add week_number column if it doesn't exist (migration)
+        await conn.execute('''
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='submissions' AND column_name='week_number'
+                ) THEN
+                    ALTER TABLE submissions ADD COLUMN week_number INT NOT NULL DEFAULT 1;
+                END IF;
+            END $$;
         ''')
 
         # Create index on photo_file_id for faster duplicate checks
@@ -159,7 +173,8 @@ async def initialize_settings():
         'since_reset_total_submissions': '0',
         'since_reset_duplicates': '0',
         'since_reset_manual_adjustments': '0',
-        'reset_at': datetime.now(IST).isoformat()
+        'reset_at': datetime.now(IST).isoformat(),
+        'current_week': '1'
     }
 
     async with _pool.acquire() as conn:
@@ -319,11 +334,16 @@ async def add_submission(
     async with _pool.acquire() as conn:
         async with conn.transaction():
             try:
-                # Try to insert submission
+                # Get current week number
+                current_week = int(await conn.fetchval(
+                    "SELECT value FROM settings WHERE key = 'current_week'"
+                ) or '1')
+
+                # Try to insert submission with week_number
                 await conn.execute('''
-                    INSERT INTO submissions (participant_id, photo_file_id, source, tg_message_id)
-                    VALUES ($1, $2, $3, $4)
-                ''', participant_id, photo_file_id, source, tg_message_id)
+                    INSERT INTO submissions (participant_id, photo_file_id, source, tg_message_id, week_number)
+                    VALUES ($1, $2, $3, $4, $5)
+                ''', participant_id, photo_file_id, source, tg_message_id, current_week)
 
                 # Increment points
                 await conn.execute('''
@@ -419,16 +439,68 @@ async def get_leaderboard(limit: int = 5) -> List[Dict]:
         return [dict(row) for row in rows]
 
 
-async def get_full_rankerinfo(limit: int = 10) -> List[Dict]:
-    """Get top participants with full details for admin verification."""
+async def get_full_rankerinfo(limit: Optional[int] = 10, week: Optional[int] = None) -> List[Dict]:
+    """
+    Get participants with full details for admin verification.
+
+    Args:
+        limit: Maximum number of participants to return (None = all)
+        week: Week number to filter by (None = cumulative/all-time)
+
+    Returns:
+        List of dicts with: code, display_name, tg_user_id, points
+    """
     async with _pool.acquire() as conn:
-        rows = await conn.fetch('''
-            SELECT id, code, display_name, tg_user_id, username, points
-            FROM participants
-            WHERE points > 0
-            ORDER BY points DESC, first_seen ASC
-            LIMIT $1
-        ''', limit)
+        if week is None:
+            # Cumulative (all-time) points
+            if limit is None:
+                rows = await conn.fetch('''
+                    SELECT id, code, display_name, tg_user_id, username, points
+                    FROM participants
+                    WHERE points > 0
+                    ORDER BY points DESC, first_seen ASC
+                ''')
+            else:
+                rows = await conn.fetch('''
+                    SELECT id, code, display_name, tg_user_id, username, points
+                    FROM participants
+                    WHERE points > 0
+                    ORDER BY points DESC, first_seen ASC
+                    LIMIT $1
+                ''', limit)
+        else:
+            # Weekly points (count submissions for specific week)
+            if limit is None:
+                rows = await conn.fetch('''
+                    SELECT
+                        p.id,
+                        p.code,
+                        p.display_name,
+                        p.tg_user_id,
+                        p.username,
+                        COUNT(s.id) as points
+                    FROM participants p
+                    LEFT JOIN submissions s ON p.id = s.participant_id AND s.week_number = $1
+                    GROUP BY p.id, p.code, p.display_name, p.tg_user_id, p.username
+                    HAVING COUNT(s.id) > 0
+                    ORDER BY points DESC, p.first_seen ASC
+                ''', week)
+            else:
+                rows = await conn.fetch('''
+                    SELECT
+                        p.id,
+                        p.code,
+                        p.display_name,
+                        p.tg_user_id,
+                        p.username,
+                        COUNT(s.id) as points
+                    FROM participants p
+                    LEFT JOIN submissions s ON p.id = s.participant_id AND s.week_number = $1
+                    GROUP BY p.id, p.code, p.display_name, p.tg_user_id, p.username
+                    HAVING COUNT(s.id) > 0
+                    ORDER BY points DESC, p.first_seen ASC
+                    LIMIT $2
+                ''', week, limit)
 
         return [dict(row) for row in rows]
 
@@ -445,6 +517,37 @@ async def get_total_submissions() -> int:
     async with _pool.acquire() as conn:
         result = await conn.fetchval('SELECT COUNT(*) FROM submissions')
         return result or 0
+
+
+async def get_current_week() -> int:
+    """Get current week number."""
+    async with _pool.acquire() as conn:
+        result = await conn.fetchval("SELECT value FROM settings WHERE key = 'current_week'")
+        return int(result) if result else 1
+
+
+async def start_new_week() -> Tuple[int, int]:
+    """
+    Start a new week by incrementing the week counter.
+    Does NOT delete any data - all history is preserved.
+
+    Returns:
+        Tuple[int, int]: (old_week, new_week)
+    """
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            # Get current week
+            old_week = await conn.fetchval("SELECT value FROM settings WHERE key = 'current_week'")
+            old_week = int(old_week) if old_week else 1
+
+            # Increment to new week
+            new_week = old_week + 1
+            await conn.execute('''
+                UPDATE settings SET value = $1 WHERE key = 'current_week'
+            ''', str(new_week))
+
+            logger.info(f"📅 Started new week: Week {old_week} → Week {new_week}")
+            return (old_week, new_week)
 
 
 # ============================================================================

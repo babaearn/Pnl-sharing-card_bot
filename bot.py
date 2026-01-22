@@ -566,18 +566,42 @@ async def cmd_pnlrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @dm_only
 async def cmd_rankerinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /rankerinfo - Show ALL participants with full verification details.
+    /rankerinfo - Show ALL participants (cumulative)
+    /rankerinfo 1 - Show week 1 only
+    /rankerinfo 2 - Show week 2 only
     """
-    rankers = await db.get_full_rankerinfo(limit=None)
+    # Parse week argument
+    week = None
+    if context.args:
+        try:
+            week = int(context.args[0])
+            if week < 1:
+                await update.message.reply_text("❌ Week number must be 1 or greater")
+                return
+        except ValueError:
+            await update.message.reply_text("❌ Invalid week number. Usage: /rankerinfo or /rankerinfo 1")
+            return
+
+    # Get ranker info
+    rankers = await db.get_full_rankerinfo(limit=None, week=week)
     total_participants = await db.get_total_participants()
     total_submissions = await db.get_total_submissions()
+    current_week = await db.get_current_week()
 
     if not rankers:
-        await update.message.reply_text("📊 No participants yet!")
+        if week:
+            await update.message.reply_text(f"📊 No participants for Week {week}!")
+        else:
+            await update.message.reply_text("📊 No participants yet!")
         return
 
-    lines = ["🔐 Ranker Info - ALL Participants\n"]
+    # Build header
+    if week:
+        lines = [f"🔐 Ranker Info - Week {week}\n"]
+    else:
+        lines = [f"🔐 Ranker Info - Cumulative (All-Time)\n"]
 
+    # Add participant list
     for entry in rankers:
         code = entry['code']
         name = entry['display_name']
@@ -588,8 +612,13 @@ async def cmd_rankerinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Add statistics at the bottom
     lines.append("")
-    lines.append(f"📊 Total Participants: {total_participants}")
-    lines.append(f"📝 Total Submissions: {total_submissions}")
+    if week:
+        lines.append(f"📅 Showing Week {week} data")
+        lines.append(f"📅 Current Week: {current_week}")
+    else:
+        lines.append(f"📅 Current Week: {current_week}")
+        lines.append(f"📊 Total Participants: {total_participants}")
+        lines.append(f"📝 Total Submissions: {total_submissions}")
 
     await update.message.reply_text("\n".join(lines))
 
@@ -662,6 +691,36 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Admin {update.effective_user.id} removed participant {participant_code}")
     else:
         await update.message.reply_text(f"❌ {message}")
+
+
+@admin_only
+@dm_only
+async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /new - Start a new week (resets leaderboard but keeps all history).
+
+    This command:
+    - Increments week counter
+    - Future submissions count toward new week
+    - All historical data is preserved
+    - Use /rankerinfo <week> to view past weeks
+    """
+    # Get current week before starting new one
+    old_week, new_week = await db.start_new_week()
+
+    message = (
+        f"📅 New Week Started!\n\n"
+        f"✅ Week {old_week} has ended\n"
+        f"✅ Week {new_week} has begun\n\n"
+        f"All historical data preserved:\n"
+        f"• Use /rankerinfo to see cumulative stats\n"
+        f"• Use /rankerinfo {old_week} to see Week {old_week}\n"
+        f"• Use /rankerinfo {new_week} to see Week {new_week}\n\n"
+        f"New submissions will count toward Week {new_week}!"
+    )
+
+    await update.message.reply_text(message)
+    logger.info(f"Admin {update.effective_user.id} started Week {new_week}")
 
 
 @admin_only
@@ -834,13 +893,18 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🔐 **Admin Commands** (DM only)
 
 **Verification:**
-/rankerinfo - Top 10 with full details
+/rankerinfo - Cumulative (all-time) stats
+/rankerinfo 1 - Week 1 stats only
+/rankerinfo 2 - Week 2 stats only
 /stats - Engagement statistics
 
 **Manual Adjustments:**
 /add #01 5 - Add points
 /add #01 -3 - Remove points
 /remove #01 - Delete participant & submissions
+
+**Weekly Management:**
+/new - Start new week (keeps all history)
 
 **Settings:**
 /pointson - Show points in public leaderboard
@@ -1030,6 +1094,7 @@ def main():
     application.add_handler(CommandHandler('rankerinfo', cmd_rankerinfo))
     application.add_handler(CommandHandler('add', cmd_add))
     application.add_handler(CommandHandler('remove', cmd_remove))
+    application.add_handler(CommandHandler('new', cmd_new))
     application.add_handler(CommandHandler('stats', cmd_stats))
     application.add_handler(CommandHandler('reset', cmd_reset))
     application.add_handler(CommandHandler('pointson', cmd_pointson))
