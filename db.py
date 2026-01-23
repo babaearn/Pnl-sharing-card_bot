@@ -839,6 +839,88 @@ async def set_current_week(week_number: int, label: Optional[str] = None) -> Tup
             return (week_number, label)
 
 
+async def get_participant_breakdown(participant_code: str, week: Optional[int] = None) -> Optional[Dict]:
+    """
+    Get detailed breakdown of participant's points (submissions + adjustments).
+
+    Args:
+        participant_code: Participant code (e.g., '#01')
+        week: Week number (None = all weeks)
+
+    Returns:
+        Dict with: code, display_name, submissions_count, adjustments_sum, total_points
+        None if participant not found
+    """
+    async with _pool.acquire() as conn:
+        # Find participant
+        participant = await conn.fetchrow('''
+            SELECT id, code, display_name, points FROM participants WHERE code = $1
+        ''', participant_code)
+
+        if not participant:
+            return None
+
+        participant_id = participant['id']
+
+        if week is None:
+            # All-time breakdown
+            submissions_count = await conn.fetchval('''
+                SELECT COUNT(*) FROM submissions WHERE participant_id = $1
+            ''', participant_id)
+
+            adjustments_sum = await conn.fetchval('''
+                SELECT COALESCE(SUM(delta), 0) FROM adjustments
+                WHERE participant_id = $1 AND week_number IS NULL
+            ''', participant_id)
+        else:
+            # Weekly breakdown
+            submissions_count = await conn.fetchval('''
+                SELECT COUNT(*) FROM submissions
+                WHERE participant_id = $1 AND week_number = $2
+            ''', participant_id, week)
+
+            adjustments_sum = await conn.fetchval('''
+                SELECT COALESCE(SUM(delta), 0) FROM adjustments
+                WHERE participant_id = $1 AND week_number = $2
+            ''', participant_id, week)
+
+        return {
+            'code': participant['code'],
+            'display_name': participant['display_name'],
+            'cumulative_points': participant['points'],
+            'submissions_count': submissions_count or 0,
+            'adjustments_sum': adjustments_sum or 0,
+            'calculated_total': (submissions_count or 0) + (adjustments_sum or 0)
+        }
+
+
+async def clear_week_adjustments(week_number: int) -> Tuple[int, str]:
+    """
+    Clear all adjustments for a specific week.
+    Use this to remove manual adjustments before re-adding them.
+
+    Args:
+        week_number: Week number to clear adjustments from
+
+    Returns:
+        Tuple[int, str]: (adjustments_deleted, summary_message)
+    """
+    async with _pool.acquire() as conn:
+        # Count adjustments
+        adjustments_count = await conn.fetchval('''
+            SELECT COUNT(*) FROM adjustments WHERE week_number = $1
+        ''', week_number)
+
+        # Delete adjustments
+        await conn.execute('''
+            DELETE FROM adjustments WHERE week_number = $1
+        ''', week_number)
+
+        logger.warning(f"🗑️ Cleared {adjustments_count} adjustments for Week {week_number}")
+
+        return (adjustments_count or 0, f"Cleared {adjustments_count} adjustment(s) for Week {week_number}")
+
+
 async def start_new_week(label: Optional[str] = None) -> Tuple[str, str, int, int]:
     """
     Start a new week by incrementing the week counter.
