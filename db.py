@@ -611,48 +611,55 @@ async def restore_week_data(week_number: int) -> Tuple[bool, str, int, int]:
 
 async def recalculate_cumulative_points() -> Tuple[int, str]:
     """
-    Recalculate cumulative points for all participants from submissions.
+    Recalculate cumulative points for all participants from submissions + cumulative adjustments.
     Use this after restoring data or if points get out of sync.
+
+    Cumulative points = All submissions + All cumulative adjustments (week_number IS NULL)
 
     Returns:
         Tuple[int, str]: (participants_updated, summary_message)
     """
     async with _pool.acquire() as conn:
         async with conn.transaction():
-            # Count submissions for each participant (all weeks)
-            submission_counts = await conn.fetch('''
-                SELECT participant_id, COUNT(*) as total_submissions
-                FROM submissions
-                GROUP BY participant_id
+            # Get ALL participants (not just those with points > 0, in case points are incorrectly 0)
+            all_participants = await conn.fetch('''
+                SELECT id, code, display_name, points FROM participants
             ''')
 
             participants_updated = 0
             updates = []
 
-            for row in submission_counts:
-                participant_id = row['participant_id']
-                correct_points = row['total_submissions']
+            for participant in all_participants:
+                participant_id = participant['id']
+                old_points = participant['points']
 
-                # Get current points and participant info
-                participant = await conn.fetchrow('''
-                    SELECT code, display_name, points FROM participants WHERE id = $1
-                ''', participant_id)
+                # Count all submissions for this participant (across all weeks)
+                submission_count = await conn.fetchval('''
+                    SELECT COUNT(*) FROM submissions WHERE participant_id = $1
+                ''', participant_id) or 0
 
-                if participant:
-                    old_points = participant['points']
+                # Sum all cumulative adjustments (week_number IS NULL)
+                cumulative_adjustments = await conn.fetchval('''
+                    SELECT COALESCE(SUM(delta), 0) FROM adjustments
+                    WHERE participant_id = $1 AND week_number IS NULL
+                ''', participant_id) or 0
 
-                    # Update if points don't match
-                    if old_points != correct_points:
-                        await conn.execute('''
-                            UPDATE participants SET points = $1, updated_at = now()
-                            WHERE id = $2
-                        ''', correct_points, participant_id)
+                # Calculate correct cumulative points (ensure non-negative)
+                correct_points = max(0, submission_count + cumulative_adjustments)
 
-                        participants_updated += 1
-                        updates.append(
-                            f"{participant['code']} {participant['display_name']}: "
-                            f"{old_points} → {correct_points} pts"
-                        )
+                # Update if points don't match
+                if old_points != correct_points:
+                    await conn.execute('''
+                        UPDATE participants SET points = $1, updated_at = now()
+                        WHERE id = $2
+                    ''', correct_points, participant_id)
+
+                    participants_updated += 1
+                    updates.append(
+                        f"{participant['code']} {participant['display_name']}: "
+                        f"{old_points} → {correct_points} pts "
+                        f"({submission_count} submissions + {cumulative_adjustments:+d} adjustments)"
+                    )
 
             logger.info(f"♻️ Recalculated points for {participants_updated} participants")
 
