@@ -692,18 +692,34 @@ async def get_leaderboard(limit: int = 5, week: Optional[int] = None) -> List[Di
             ''', limit)
         else:
             # Weekly points (count submissions + adjustments for specific week)
+            # Use subqueries to avoid Cartesian product when joining submissions and adjustments
             rows = await conn.fetch('''
                 SELECT
                     p.code,
                     p.display_name,
                     p.tg_user_id,
                     p.username,
-                    (COUNT(DISTINCT s.id) + COALESCE(SUM(a.delta), 0))::int as points
+                    (
+                        COALESCE(
+                            (SELECT COUNT(*) FROM submissions s
+                             WHERE s.participant_id = p.id AND s.week_number = $1), 0
+                        ) +
+                        COALESCE(
+                            (SELECT SUM(delta) FROM adjustments a
+                             WHERE a.participant_id = p.id AND a.week_number = $1), 0
+                        )
+                    )::int as points
                 FROM participants p
-                LEFT JOIN submissions s ON p.id = s.participant_id AND s.week_number = $1
-                LEFT JOIN adjustments a ON p.id = a.participant_id AND a.week_number = $1
-                GROUP BY p.id, p.code, p.display_name, p.tg_user_id, p.username
-                HAVING (COUNT(DISTINCT s.id) + COALESCE(SUM(a.delta), 0)) > 0
+                WHERE (
+                    COALESCE(
+                        (SELECT COUNT(*) FROM submissions s
+                         WHERE s.participant_id = p.id AND s.week_number = $1), 0
+                    ) +
+                    COALESCE(
+                        (SELECT SUM(delta) FROM adjustments a
+                         WHERE a.participant_id = p.id AND a.week_number = $1), 0
+                    )
+                ) > 0
                 ORDER BY points DESC, p.first_seen ASC
                 LIMIT $2
             ''', week, limit)
@@ -742,6 +758,7 @@ async def get_full_rankerinfo(limit: Optional[int] = 10, week: Optional[int] = N
                 ''', limit)
         else:
             # Weekly points (count submissions + adjustments for specific week)
+            # Use subqueries to avoid Cartesian product when joining submissions and adjustments
             if limit is None:
                 rows = await conn.fetch('''
                     SELECT
@@ -750,12 +767,27 @@ async def get_full_rankerinfo(limit: Optional[int] = 10, week: Optional[int] = N
                         p.display_name,
                         p.tg_user_id,
                         p.username,
-                        (COUNT(DISTINCT s.id) + COALESCE(SUM(a.delta), 0))::int as points
+                        (
+                            COALESCE(
+                                (SELECT COUNT(*) FROM submissions s
+                                 WHERE s.participant_id = p.id AND s.week_number = $1), 0
+                            ) +
+                            COALESCE(
+                                (SELECT SUM(delta) FROM adjustments a
+                                 WHERE a.participant_id = p.id AND a.week_number = $1), 0
+                            )
+                        )::int as points
                     FROM participants p
-                    LEFT JOIN submissions s ON p.id = s.participant_id AND s.week_number = $1
-                    LEFT JOIN adjustments a ON p.id = a.participant_id AND a.week_number = $1
-                    GROUP BY p.id, p.code, p.display_name, p.tg_user_id, p.username
-                    HAVING (COUNT(DISTINCT s.id) + COALESCE(SUM(a.delta), 0)) > 0
+                    WHERE (
+                        COALESCE(
+                            (SELECT COUNT(*) FROM submissions s
+                             WHERE s.participant_id = p.id AND s.week_number = $1), 0
+                        ) +
+                        COALESCE(
+                            (SELECT SUM(delta) FROM adjustments a
+                             WHERE a.participant_id = p.id AND a.week_number = $1), 0
+                        )
+                    ) > 0
                     ORDER BY points DESC, p.first_seen ASC
                 ''', week)
             else:
@@ -766,12 +798,27 @@ async def get_full_rankerinfo(limit: Optional[int] = 10, week: Optional[int] = N
                         p.display_name,
                         p.tg_user_id,
                         p.username,
-                        (COUNT(DISTINCT s.id) + COALESCE(SUM(a.delta), 0))::int as points
+                        (
+                            COALESCE(
+                                (SELECT COUNT(*) FROM submissions s
+                                 WHERE s.participant_id = p.id AND s.week_number = $1), 0
+                            ) +
+                            COALESCE(
+                                (SELECT SUM(delta) FROM adjustments a
+                                 WHERE a.participant_id = p.id AND a.week_number = $1), 0
+                            )
+                        )::int as points
                     FROM participants p
-                    LEFT JOIN submissions s ON p.id = s.participant_id AND s.week_number = $1
-                    LEFT JOIN adjustments a ON p.id = a.participant_id AND a.week_number = $1
-                    GROUP BY p.id, p.code, p.display_name, p.tg_user_id, p.username
-                    HAVING (COUNT(DISTINCT s.id) + COALESCE(SUM(a.delta), 0)) > 0
+                    WHERE (
+                        COALESCE(
+                            (SELECT COUNT(*) FROM submissions s
+                             WHERE s.participant_id = p.id AND s.week_number = $1), 0
+                        ) +
+                        COALESCE(
+                            (SELECT SUM(delta) FROM adjustments a
+                             WHERE a.participant_id = p.id AND a.week_number = $1), 0
+                        )
+                    ) > 0
                     ORDER BY points DESC, p.first_seen ASC
                     LIMIT $2
                 ''', week, limit)
