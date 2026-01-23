@@ -969,6 +969,63 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 @dm_only
+async def cmd_current(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /current week 2 - Set current week to Week 2
+    /current week 2 week2 - Set current week to 2 with label "week2"
+
+    Use this to manually control which week submissions count toward.
+    """
+    # Parse "week N" format or just "N"
+    args = context.args
+
+    if len(args) < 1:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/current week 2 - Set to Week 2\n"
+            "/current week 2 week2 - Set to Week 2 labeled 'week2'"
+        )
+        return
+
+    # Handle "week N" format
+    if args[0].lower() == 'week' and len(args) >= 2:
+        try:
+            week_number = int(args[1])
+        except ValueError:
+            await update.message.reply_text("❌ Week number must be a number")
+            return
+        # Label is everything after the week number
+        label = " ".join(args[2:]) if len(args) > 2 else None
+    else:
+        # Handle just "N" format
+        try:
+            week_number = int(args[0])
+        except ValueError:
+            await update.message.reply_text("❌ Week number must be a number")
+            return
+        # Label is everything after the week number
+        label = " ".join(args[1:]) if len(args) > 1 else None
+
+    if week_number < 1:
+        await update.message.reply_text("❌ Week number must be 1 or greater")
+        return
+
+    # Set current week
+    week_number, label = await db.set_current_week(week_number, label)
+
+    message = (
+        f"⚙️ Week Manually Set!\n\n"
+        f"✅ Current week is now: {label} (Week {week_number})\n\n"
+        f"New submissions will count toward {label}.\n"
+        f"Use /pnlrank to see the current week leaderboard."
+    )
+
+    await update.message.reply_text(message)
+    logger.warning(f"Admin {update.effective_user.id} manually set week to {week_number} ({label})")
+
+
+@admin_only
+@dm_only
 async def cmd_setweek(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /setweek 2 - Set current week to Week 2
@@ -1314,56 +1371,41 @@ async def cmd_winners(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show admin command help."""
     text = """
-🔐 **Admin Commands** (DM only)
+🔐 **PnL Flex Challenge Bot - Admin Commands** (DM only)
 
-**Verification:**
-/rankerinfo - Cumulative (all-time) stats
-/rankerinfo 1 - Week 1 stats only
-/rankerinfo 2 - Week 2 stats only
+**📊 View Leaderboards:**
+/pnlrank - Show Top 10 for current week (PUBLIC)
+/rankerinfo - View all participants (cumulative)
+/rankerinfo 2 - View Week 2 leaderboard only
 /stats - Engagement statistics
 
-**Manual Adjustments:**
-/add #01 5 - Add 5 cumulative points
-/add #01 -3 - Remove 3 cumulative points
-/add #01 current 5 - Add 5 to current week
-/add #01 week2 5 - Add 5 to week labeled "week2"
-/add #01 4 5 - Add 5 to week number 4
-/bulkadd #01 current 5 #02 current 3 - Bulk add
-/remove #01 - Delete participant & submissions
+**📅 Week Management:**
+/current week 2 - Set current week to Week 2
+/current week 2 week2 - Set to Week 2 with label "week2"
 
-**Weekly Management:**
-/new - Start new week (auto-numbered)
-/new week2 - Start "week2" (custom label)
-/new week 3 - Start "week 3" (custom label)
-/setweek 2 - Manually set to Week 2
-/setweek 2 week2 - Set to Week 2 labeled "week2"
-/removedata 4 - Delete all data from week 4
-/undodata 4 - Restore deleted week 4 data
-/recalculate - Fix cumulative points (use after undo)
+**✏️ Manual Adjustments:**
+/add #33 2 21 - Add 21 points to participant #33 for Week 2
+/add #33 current 10 - Add 10 points to current week
+/add #33 5 - Add 5 cumulative points (all-time)
+/add #33 -3 - Remove 3 cumulative points
 
-**Diagnostics:**
-/breakdown #33 - Show point breakdown (cumulative)
-/breakdown #33 2 - Show point breakdown for week 2
-/clearadjustments 2 - Clear all week 2 adjustments
+**🔍 Diagnostics:**
+/breakdown 33 - Show point breakdown (cumulative)
+/breakdown 33 2 - Show point breakdown for Week 2 only
 
-**Settings:**
-/pointson - Show points in public leaderboard
-/pointsoff - Hide points in public leaderboard
+**🗑️ Cleanup:**
+/remove 33 - Delete participant and all submissions
 
-**Winners:**
-/selectwinners <week> - Save Top 5 for week
-/winners <week> - View saved winners
+**🔧 Advanced (if needed):**
+/recalculate - Fix point mismatches (rarely needed)
 
-**Management:**
-/reset - Clear all data (requires CONFIRM)
+**📖 How It Works:**
+1. Users submit PnL photos in the topic → auto-added to current week
+2. Use /current week 2 to manually control which week is active
+3. Add manual adjustments with /add #33 2 21
+4. View leaderboards with /pnlrank (current week) or /rankerinfo 2 (specific week)
 
-**Health:**
-/test - Bot health check
-/testdata - Database transaction test
-
-**Batch Forwarding:**
-Forward multiple PnL photos at once to bot DM.
-Bot will show progress and final summary.
+All submissions are automatically tracked and calculated!
     """
     await update.message.reply_text(text)
 
@@ -1530,27 +1572,32 @@ def main():
         )
     )
 
-    # Admin commands
+    # Admin commands (ESSENTIAL ONLY - cleaned up for simplicity)
     application.add_handler(CommandHandler('rankerinfo', cmd_rankerinfo))
     application.add_handler(CommandHandler('add', cmd_add))
-    application.add_handler(CommandHandler('bulkadd', cmd_bulkadd))
-    application.add_handler(CommandHandler('remove', cmd_remove))
-    application.add_handler(CommandHandler('removedata', cmd_removedata))
-    application.add_handler(CommandHandler('undodata', cmd_undodata))
-    application.add_handler(CommandHandler('new', cmd_new))
-    application.add_handler(CommandHandler('setweek', cmd_setweek))
-    application.add_handler(CommandHandler('recalculate', cmd_recalculate))
     application.add_handler(CommandHandler('breakdown', cmd_breakdown))
-    application.add_handler(CommandHandler('clearadjustments', cmd_clearadjustments))
+    application.add_handler(CommandHandler('current', cmd_current))  # Manual week control
+    application.add_handler(CommandHandler('remove', cmd_remove))
     application.add_handler(CommandHandler('stats', cmd_stats))
-    application.add_handler(CommandHandler('reset', cmd_reset))
-    application.add_handler(CommandHandler('pointson', cmd_pointson))
-    application.add_handler(CommandHandler('pointsoff', cmd_pointsoff))
-    application.add_handler(CommandHandler('selectwinners', cmd_selectwinners))
-    application.add_handler(CommandHandler('winners', cmd_winners))
     application.add_handler(CommandHandler('help', cmd_help))
-    application.add_handler(CommandHandler('test', cmd_test))
-    application.add_handler(CommandHandler('testdata', cmd_testdata))
+
+    # Backup/advanced commands (keep but not in main flow)
+    application.add_handler(CommandHandler('recalculate', cmd_recalculate))  # Fix point mismatches if needed
+    application.add_handler(CommandHandler('setweek', cmd_setweek))  # Legacy alias for /current
+
+    # REMOVED COMMANDS (commented out to avoid confusion):
+    # application.add_handler(CommandHandler('new', cmd_new))  # Auto week increment - use /current instead
+    # application.add_handler(CommandHandler('bulkadd', cmd_bulkadd))  # Not needed
+    # application.add_handler(CommandHandler('removedata', cmd_removedata))  # Dangerous
+    # application.add_handler(CommandHandler('undodata', cmd_undodata))  # Dangerous
+    # application.add_handler(CommandHandler('clearadjustments', cmd_clearadjustments))  # Dangerous
+    # application.add_handler(CommandHandler('reset', cmd_reset))  # Dangerous
+    # application.add_handler(CommandHandler('pointson', cmd_pointson))  # Not essential
+    # application.add_handler(CommandHandler('pointsoff', cmd_pointsoff))  # Not essential
+    # application.add_handler(CommandHandler('selectwinners', cmd_selectwinners))  # Not essential
+    # application.add_handler(CommandHandler('winners', cmd_winners))  # Not essential
+    # application.add_handler(CommandHandler('test', cmd_test))  # Debug only
+    # application.add_handler(CommandHandler('testdata', cmd_testdata))  # Debug only
 
     # Start bot
     logger.info("🎯 Bot starting...")
