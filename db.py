@@ -176,6 +176,38 @@ async def create_tables():
             )
         ''')
 
+        # Deleted submissions backup (for undo functionality)
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS deleted_submissions (
+                id SERIAL PRIMARY KEY,
+                original_id INT NOT NULL,
+                participant_id INT NOT NULL,
+                photo_file_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                tg_message_id BIGINT NULL,
+                week_number INT NOT NULL,
+                original_created_at TIMESTAMPTZ NOT NULL,
+                deleted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                deleted_by_admin BIGINT NOT NULL
+            )
+        ''')
+
+        # Deleted adjustments backup (for undo functionality)
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS deleted_adjustments (
+                id SERIAL PRIMARY KEY,
+                original_id INT NOT NULL,
+                participant_id INT NOT NULL,
+                delta INT NOT NULL,
+                admin_tg_user_id BIGINT NOT NULL,
+                note TEXT NULL,
+                week_number INT NULL,
+                original_created_at TIMESTAMPTZ NOT NULL,
+                deleted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                deleted_by_admin BIGINT NOT NULL
+            )
+        ''')
+
         logger.info("✅ All tables created/verified")
 
 
@@ -432,13 +464,15 @@ async def delete_participant(code: str) -> Tuple[bool, str]:
             return (True, f"Deleted {code} ({display_name}) - {points} pts removed")
 
 
-async def delete_week_data(week_number: int) -> Tuple[bool, str, int, int]:
+async def delete_week_data(week_number: int, admin_id: int) -> Tuple[bool, str, int, int]:
     """
     Delete all submissions and adjustments for a specific week.
+    Backs up data to deleted_* tables before deletion (for undo).
     Does NOT delete participants - only their week-specific data.
 
     Args:
         week_number: Week number to delete data from
+        admin_id: Admin user ID who performed the deletion
 
     Returns:
         Tuple[bool, str, int, int]: (success, message, submissions_deleted, adjustments_deleted)
@@ -448,6 +482,28 @@ async def delete_week_data(week_number: int) -> Tuple[bool, str, int, int]:
 
     async with _pool.acquire() as conn:
         async with conn.transaction():
+            # Backup submissions to deleted_submissions before deleting
+            await conn.execute('''
+                INSERT INTO deleted_submissions
+                    (original_id, participant_id, photo_file_id, source, tg_message_id,
+                     week_number, original_created_at, deleted_by_admin)
+                SELECT id, participant_id, photo_file_id, source, tg_message_id,
+                       week_number, created_at, $2
+                FROM submissions
+                WHERE week_number = $1
+            ''', week_number, admin_id)
+
+            # Backup adjustments to deleted_adjustments before deleting
+            await conn.execute('''
+                INSERT INTO deleted_adjustments
+                    (original_id, participant_id, delta, admin_tg_user_id, note,
+                     week_number, original_created_at, deleted_by_admin)
+                SELECT id, participant_id, delta, admin_tg_user_id, note,
+                       week_number, created_at, $2
+                FROM adjustments
+                WHERE week_number = $1
+            ''', week_number, admin_id)
+
             # Count and delete submissions for this week
             submissions_count = await conn.fetchval('''
                 SELECT COUNT(*) FROM submissions WHERE week_number = $1
@@ -467,7 +523,7 @@ async def delete_week_data(week_number: int) -> Tuple[bool, str, int, int]:
             ''', week_number)
 
             logger.warning(
-                f"🗑️ Deleted Week {week_number} data: "
+                f"🗑️ Deleted Week {week_number} data (backed up): "
                 f"{submissions_count} submissions, {adjustments_count} adjustments"
             )
 
@@ -475,10 +531,82 @@ async def delete_week_data(week_number: int) -> Tuple[bool, str, int, int]:
                 f"Week {week_number} data deleted:\n"
                 f"• {submissions_count} submissions removed\n"
                 f"• {adjustments_count} adjustments removed\n"
-                f"Participants remain intact."
+                f"Participants remain intact.\n"
+                f"Use /undodata {week_number} to restore."
             )
 
             return (True, message, submissions_count or 0, adjustments_count or 0)
+
+
+async def restore_week_data(week_number: int) -> Tuple[bool, str, int, int]:
+    """
+    Restore submissions and adjustments for a specific week from backup.
+    Undoes a previous /removedata operation.
+
+    Args:
+        week_number: Week number to restore data for
+
+    Returns:
+        Tuple[bool, str, int, int]: (success, message, submissions_restored, adjustments_restored)
+    """
+    if week_number < 1:
+        return (False, "Week number must be 1 or greater", 0, 0)
+
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            # Check if there's backup data for this week
+            submissions_in_backup = await conn.fetchval('''
+                SELECT COUNT(*) FROM deleted_submissions WHERE week_number = $1
+            ''', week_number)
+
+            adjustments_in_backup = await conn.fetchval('''
+                SELECT COUNT(*) FROM deleted_adjustments WHERE week_number = $1
+            ''', week_number)
+
+            if submissions_in_backup == 0 and adjustments_in_backup == 0:
+                return (False, f"No backup data found for Week {week_number}", 0, 0)
+
+            # Restore submissions from backup
+            await conn.execute('''
+                INSERT INTO submissions
+                    (participant_id, photo_file_id, source, tg_message_id, week_number, created_at)
+                SELECT participant_id, photo_file_id, source, tg_message_id, week_number, original_created_at
+                FROM deleted_submissions
+                WHERE week_number = $1
+                ON CONFLICT (participant_id, photo_file_id) DO NOTHING
+            ''', week_number)
+
+            # Restore adjustments from backup
+            await conn.execute('''
+                INSERT INTO adjustments
+                    (participant_id, delta, admin_tg_user_id, note, week_number, created_at)
+                SELECT participant_id, delta, admin_tg_user_id, note, week_number, original_created_at
+                FROM deleted_adjustments
+                WHERE week_number = $1
+            ''', week_number)
+
+            # Clean up backup data after successful restore
+            await conn.execute('''
+                DELETE FROM deleted_submissions WHERE week_number = $1
+            ''', week_number)
+
+            await conn.execute('''
+                DELETE FROM deleted_adjustments WHERE week_number = $1
+            ''', week_number)
+
+            logger.info(
+                f"♻️ Restored Week {week_number} data: "
+                f"{submissions_in_backup} submissions, {adjustments_in_backup} adjustments"
+            )
+
+            message = (
+                f"Week {week_number} data restored:\n"
+                f"• {submissions_in_backup} submissions restored\n"
+                f"• {adjustments_in_backup} adjustments restored\n"
+                f"Data successfully recovered!"
+            )
+
+            return (True, message, submissions_in_backup or 0, adjustments_in_backup or 0)
 
 
 # ============================================================================

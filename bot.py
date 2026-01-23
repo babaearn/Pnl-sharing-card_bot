@@ -773,8 +773,11 @@ async def cmd_removedata(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Week number must be a number")
         return
 
-    # Perform deletion
-    success, message, submissions_deleted, adjustments_deleted = await db.delete_week_data(week_number)
+    # Perform deletion (with backup for undo)
+    success, message, submissions_deleted, adjustments_deleted = await db.delete_week_data(
+        week_number,
+        update.effective_user.id
+    )
 
     if success:
         response = (
@@ -785,6 +788,48 @@ async def cmd_removedata(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(
             f"Admin {update.effective_user.id} deleted Week {week_number} data: "
             f"{submissions_deleted} submissions, {adjustments_deleted} adjustments"
+        )
+    else:
+        await update.message.reply_text(f"❌ {message}")
+
+
+@admin_only
+@dm_only
+async def cmd_undodata(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /undodata 4 - Restore deleted data for week 4.
+
+    Restores all submissions and adjustments that were deleted with /removedata.
+    Can only restore the most recent deletion for each week.
+    """
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "Usage: /undodata <week>\n"
+            "Example: /undodata 4 (restores week 4 data)"
+        )
+        return
+
+    try:
+        week_number = int(context.args[0])
+        if week_number < 1:
+            await update.message.reply_text("❌ Week number must be 1 or greater")
+            return
+    except ValueError:
+        await update.message.reply_text("❌ Week number must be a number")
+        return
+
+    # Perform restoration
+    success, message, submissions_restored, adjustments_restored = await db.restore_week_data(week_number)
+
+    if success:
+        response = (
+            f"♻️ Week {week_number} Data Restored\n\n"
+            f"{message}"
+        )
+        await update.message.reply_text(response)
+        logger.info(
+            f"Admin {update.effective_user.id} restored Week {week_number} data: "
+            f"{submissions_restored} submissions, {adjustments_restored} adjustments"
         )
     else:
         await update.message.reply_text(f"❌ {message}")
@@ -1059,6 +1104,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /setweek 2 - Manually set to Week 2
 /setweek 2 week2 - Set to Week 2 labeled "week2"
 /removedata 4 - Delete all data from week 4
+/undodata 4 - Restore deleted week 4 data
 
 **Settings:**
 /pointson - Show points in public leaderboard
@@ -1249,6 +1295,7 @@ def main():
     application.add_handler(CommandHandler('add', cmd_add))
     application.add_handler(CommandHandler('remove', cmd_remove))
     application.add_handler(CommandHandler('removedata', cmd_removedata))
+    application.add_handler(CommandHandler('undodata', cmd_undodata))
     application.add_handler(CommandHandler('new', cmd_new))
     application.add_handler(CommandHandler('setweek', cmd_setweek))
     application.add_handler(CommandHandler('stats', cmd_stats))
