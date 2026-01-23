@@ -698,12 +698,12 @@ async def get_leaderboard(limit: int = 5, week: Optional[int] = None) -> List[Di
                     p.display_name,
                     p.tg_user_id,
                     p.username,
-                    (COUNT(s.id) + COALESCE(SUM(a.delta), 0))::int as points
+                    (COUNT(DISTINCT s.id) + COALESCE(SUM(a.delta), 0))::int as points
                 FROM participants p
                 LEFT JOIN submissions s ON p.id = s.participant_id AND s.week_number = $1
                 LEFT JOIN adjustments a ON p.id = a.participant_id AND a.week_number = $1
                 GROUP BY p.id, p.code, p.display_name, p.tg_user_id, p.username
-                HAVING (COUNT(s.id) + COALESCE(SUM(a.delta), 0)) > 0
+                HAVING (COUNT(DISTINCT s.id) + COALESCE(SUM(a.delta), 0)) > 0
                 ORDER BY points DESC, p.first_seen ASC
                 LIMIT $2
             ''', week, limit)
@@ -750,12 +750,12 @@ async def get_full_rankerinfo(limit: Optional[int] = 10, week: Optional[int] = N
                         p.display_name,
                         p.tg_user_id,
                         p.username,
-                        (COUNT(s.id) + COALESCE(SUM(a.delta), 0))::int as points
+                        (COUNT(DISTINCT s.id) + COALESCE(SUM(a.delta), 0))::int as points
                     FROM participants p
                     LEFT JOIN submissions s ON p.id = s.participant_id AND s.week_number = $1
                     LEFT JOIN adjustments a ON p.id = a.participant_id AND a.week_number = $1
                     GROUP BY p.id, p.code, p.display_name, p.tg_user_id, p.username
-                    HAVING (COUNT(s.id) + COALESCE(SUM(a.delta), 0)) > 0
+                    HAVING (COUNT(DISTINCT s.id) + COALESCE(SUM(a.delta), 0)) > 0
                     ORDER BY points DESC, p.first_seen ASC
                 ''', week)
             else:
@@ -766,12 +766,12 @@ async def get_full_rankerinfo(limit: Optional[int] = 10, week: Optional[int] = N
                         p.display_name,
                         p.tg_user_id,
                         p.username,
-                        (COUNT(s.id) + COALESCE(SUM(a.delta), 0))::int as points
+                        (COUNT(DISTINCT s.id) + COALESCE(SUM(a.delta), 0))::int as points
                     FROM participants p
                     LEFT JOIN submissions s ON p.id = s.participant_id AND s.week_number = $1
                     LEFT JOIN adjustments a ON p.id = a.participant_id AND a.week_number = $1
                     GROUP BY p.id, p.code, p.display_name, p.tg_user_id, p.username
-                    HAVING (COUNT(s.id) + COALESCE(SUM(a.delta), 0)) > 0
+                    HAVING (COUNT(DISTINCT s.id) + COALESCE(SUM(a.delta), 0)) > 0
                     ORDER BY points DESC, p.first_seen ASC
                     LIMIT $2
                 ''', week, limit)
