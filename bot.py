@@ -716,6 +716,106 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 @dm_only
+async def cmd_bulkadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /bulkadd #01 current 5 #02 current 3 #03 2 10
+
+    Add points to multiple participants at once.
+    Format: code week delta code week delta code week delta...
+
+    Examples:
+    /bulkadd #01 current 5 #02 current 3
+    /bulkadd #22 current 31 #33 current 21 #07 current 12
+    """
+    if len(context.args) < 3 or len(context.args) % 3 != 0:
+        await update.message.reply_text(
+            "Usage: /bulkadd <code> <week> <delta> [<code> <week> <delta>...]\n\n"
+            "Examples:\n"
+            "/bulkadd #01 current 5 #02 current 3\n"
+            "/bulkadd #22 current 31 #33 current 21 #07 current 12\n\n"
+            "Arguments must be in groups of 3: code, week, delta"
+        )
+        return
+
+    # Parse arguments in groups of 3
+    updates = []
+    for i in range(0, len(context.args), 3):
+        participant_code = context.args[i]
+        week_str = context.args[i + 1]
+        delta_str = context.args[i + 2]
+
+        # Validate code
+        if not participant_code.startswith('#'):
+            await update.message.reply_text(f"❌ Code must start with # (got: {participant_code})")
+            return
+
+        # Parse week
+        if week_str.lower() == "current":
+            week_number = await db.get_current_week()
+        else:
+            # Check if it matches current week label
+            current_week_label = await db.get_week_label()
+            current_week_number = await db.get_current_week()
+
+            if week_str.lower() == current_week_label.lower():
+                week_number = current_week_number
+            else:
+                # Extract number from week string
+                import re
+                match = re.search(r'\d+', week_str)
+                if not match:
+                    await update.message.reply_text(f"❌ Invalid week: {week_str}")
+                    return
+                week_number = int(match.group())
+
+        # Parse delta
+        try:
+            delta = int(delta_str)
+        except ValueError:
+            await update.message.reply_text(f"❌ Delta must be a number (got: {delta_str})")
+            return
+
+        updates.append((participant_code, week_number, delta))
+
+    # Perform all updates
+    success_count = 0
+    fail_count = 0
+    results = []
+
+    for participant_code, week_number, delta in updates:
+        success, message, new_points = await db.add_adjustment(
+            participant_code=participant_code,
+            delta=delta,
+            admin_tg_user_id=update.effective_user.id,
+            note=f"Bulk adjustment by admin {update.effective_user.id}",
+            week_number=week_number
+        )
+
+        if success:
+            success_count += 1
+            results.append(f"✅ {participant_code}: {message}")
+        else:
+            fail_count += 1
+            results.append(f"❌ {participant_code}: {message}")
+
+    # Send summary
+    summary = (
+        f"📊 Bulk Update Complete\n\n"
+        f"✅ Success: {success_count}\n"
+        f"❌ Failed: {fail_count}\n\n"
+    )
+
+    # Add first 10 results
+    summary += "\n".join(results[:10])
+    if len(results) > 10:
+        summary += f"\n... and {len(results) - 10} more"
+
+    await update.message.reply_text(summary)
+    logger.info(f"Admin {update.effective_user.id} bulk updated {success_count} participants")
+
+
+@admin_only
+@dm_only
 async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /remove #01 - Remove a participant and all their submissions.
@@ -1122,6 +1222,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /add #01 current 5 - Add 5 to current week
 /add #01 week2 5 - Add 5 to week labeled "week2"
 /add #01 4 5 - Add 5 to week number 4
+/bulkadd #01 current 5 #02 current 3 - Bulk add
 /remove #01 - Delete participant & submissions
 
 **Weekly Management:**
@@ -1321,6 +1422,7 @@ def main():
     # Admin commands
     application.add_handler(CommandHandler('rankerinfo', cmd_rankerinfo))
     application.add_handler(CommandHandler('add', cmd_add))
+    application.add_handler(CommandHandler('bulkadd', cmd_bulkadd))
     application.add_handler(CommandHandler('remove', cmd_remove))
     application.add_handler(CommandHandler('removedata', cmd_removedata))
     application.add_handler(CommandHandler('undodata', cmd_undodata))
