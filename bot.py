@@ -1043,6 +1043,116 @@ async def cmd_recalculate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 @dm_only
+async def cmd_breakdown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /breakdown #33 - Show detailed point breakdown for a participant.
+    /breakdown #33 2 - Show breakdown for week 2 only.
+
+    Displays:
+    - Submissions count
+    - Adjustments sum
+    - Calculated total
+    - Comparison with stored points
+    """
+    if len(context.args) < 1:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/breakdown #33 - Cumulative breakdown\n"
+            "/breakdown #33 2 - Week 2 breakdown only"
+        )
+        return
+
+    participant_code = context.args[0]
+    week = None
+
+    if len(context.args) >= 2:
+        try:
+            week = int(context.args[1])
+            if week < 1:
+                await update.message.reply_text("❌ Week number must be 1 or greater")
+                return
+        except ValueError:
+            await update.message.reply_text("❌ Week must be a number")
+            return
+
+    # Get breakdown
+    breakdown = await db.get_participant_breakdown(participant_code, week)
+
+    if not breakdown:
+        await update.message.reply_text(f"❌ Participant {participant_code} not found")
+        return
+
+    # Format response
+    if week:
+        title = f"📊 Point Breakdown - {breakdown['code']} ({breakdown['display_name']}) - Week {week}"
+    else:
+        title = f"📊 Point Breakdown - {breakdown['code']} ({breakdown['display_name']}) - Cumulative"
+
+    lines = [
+        title,
+        "",
+        f"📸 Submissions: {breakdown['submissions_count']}",
+        f"✏️ Adjustments: {breakdown['adjustments_sum']:+d}",
+        f"➕ Calculated Total: {breakdown['calculated_total']}",
+        "",
+        f"🗄️ Stored Points: {breakdown['cumulative_points']}",
+    ]
+
+    # Check if there's a mismatch
+    if not week and breakdown['calculated_total'] != breakdown['cumulative_points']:
+        lines.append("")
+        lines.append(f"⚠️ MISMATCH DETECTED!")
+        lines.append(f"Difference: {breakdown['calculated_total'] - breakdown['cumulative_points']:+d}")
+        lines.append("")
+        lines.append("Run /recalculate to fix cumulative points")
+
+    await update.message.reply_text("\n".join(lines))
+    logger.info(f"Admin {update.effective_user.id} viewed breakdown for {participant_code}")
+
+
+@admin_only
+@dm_only
+async def cmd_clearadjustments(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /clearadjustments 2 - Clear all adjustments for week 2.
+
+    Use this to remove incorrect manual adjustments.
+    WARNING: This cannot be undone!
+    """
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "Usage: /clearadjustments <week>\n"
+            "Example: /clearadjustments 2"
+        )
+        return
+
+    try:
+        week_number = int(context.args[0])
+        if week_number < 1:
+            await update.message.reply_text("❌ Week number must be 1 or greater")
+            return
+    except ValueError:
+        await update.message.reply_text("❌ Week must be a number")
+        return
+
+    # Clear adjustments
+    count, message = await db.clear_week_adjustments(week_number)
+
+    if count == 0:
+        await update.message.reply_text(f"ℹ️ No adjustments found for Week {week_number}")
+    else:
+        response = (
+            f"🗑️ Adjustments Cleared\n\n"
+            f"{message}\n\n"
+            f"⚠️ This action cannot be undone!\n"
+            f"Run /recalculate if needed to update cumulative points."
+        )
+        await update.message.reply_text(response)
+        logger.warning(f"Admin {update.effective_user.id} cleared {count} adjustments for Week {week_number}")
+
+
+@admin_only
+@dm_only
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /stats - Show engagement statistics since last reset.
@@ -1234,6 +1344,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /removedata 4 - Delete all data from week 4
 /undodata 4 - Restore deleted week 4 data
 /recalculate - Fix cumulative points (use after undo)
+
+**Diagnostics:**
+/breakdown #33 - Show point breakdown (cumulative)
+/breakdown #33 2 - Show point breakdown for week 2
+/clearadjustments 2 - Clear all week 2 adjustments
 
 **Settings:**
 /pointson - Show points in public leaderboard
@@ -1429,6 +1544,8 @@ def main():
     application.add_handler(CommandHandler('new', cmd_new))
     application.add_handler(CommandHandler('setweek', cmd_setweek))
     application.add_handler(CommandHandler('recalculate', cmd_recalculate))
+    application.add_handler(CommandHandler('breakdown', cmd_breakdown))
+    application.add_handler(CommandHandler('clearadjustments', cmd_clearadjustments))
     application.add_handler(CommandHandler('stats', cmd_stats))
     application.add_handler(CommandHandler('reset', cmd_reset))
     application.add_handler(CommandHandler('pointson', cmd_pointson))
