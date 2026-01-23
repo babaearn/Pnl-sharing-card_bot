@@ -749,6 +749,49 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 @dm_only
+async def cmd_removedata(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /removedata 4 - Delete all data for week 4.
+
+    Removes all submissions and adjustments for the specified week.
+    Participants remain intact (only their week-specific data is removed).
+    Use this to clean up duplicate/wrong week data.
+    """
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "Usage: /removedata <week>\n"
+            "Example: /removedata 4 (removes all data from week 4)"
+        )
+        return
+
+    try:
+        week_number = int(context.args[0])
+        if week_number < 1:
+            await update.message.reply_text("❌ Week number must be 1 or greater")
+            return
+    except ValueError:
+        await update.message.reply_text("❌ Week number must be a number")
+        return
+
+    # Perform deletion
+    success, message, submissions_deleted, adjustments_deleted = await db.delete_week_data(week_number)
+
+    if success:
+        response = (
+            f"✅ Week {week_number} Data Deleted\n\n"
+            f"{message}"
+        )
+        await update.message.reply_text(response)
+        logger.warning(
+            f"Admin {update.effective_user.id} deleted Week {week_number} data: "
+            f"{submissions_deleted} submissions, {adjustments_deleted} adjustments"
+        )
+    else:
+        await update.message.reply_text(f"❌ {message}")
+
+
+@admin_only
+@dm_only
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /new - Start a new week (resets leaderboard but keeps all history).
@@ -1015,6 +1058,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /new week 3 - Start "week 3" (custom label)
 /setweek 2 - Manually set to Week 2
 /setweek 2 week2 - Set to Week 2 labeled "week2"
+/removedata 4 - Delete all data from week 4
 
 **Settings:**
 /pointson - Show points in public leaderboard
@@ -1204,6 +1248,7 @@ def main():
     application.add_handler(CommandHandler('rankerinfo', cmd_rankerinfo))
     application.add_handler(CommandHandler('add', cmd_add))
     application.add_handler(CommandHandler('remove', cmd_remove))
+    application.add_handler(CommandHandler('removedata', cmd_removedata))
     application.add_handler(CommandHandler('new', cmd_new))
     application.add_handler(CommandHandler('setweek', cmd_setweek))
     application.add_handler(CommandHandler('stats', cmd_stats))

@@ -432,6 +432,55 @@ async def delete_participant(code: str) -> Tuple[bool, str]:
             return (True, f"Deleted {code} ({display_name}) - {points} pts removed")
 
 
+async def delete_week_data(week_number: int) -> Tuple[bool, str, int, int]:
+    """
+    Delete all submissions and adjustments for a specific week.
+    Does NOT delete participants - only their week-specific data.
+
+    Args:
+        week_number: Week number to delete data from
+
+    Returns:
+        Tuple[bool, str, int, int]: (success, message, submissions_deleted, adjustments_deleted)
+    """
+    if week_number < 1:
+        return (False, "Week number must be 1 or greater", 0, 0)
+
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            # Count and delete submissions for this week
+            submissions_count = await conn.fetchval('''
+                SELECT COUNT(*) FROM submissions WHERE week_number = $1
+            ''', week_number)
+
+            await conn.execute('''
+                DELETE FROM submissions WHERE week_number = $1
+            ''', week_number)
+
+            # Count and delete adjustments for this week
+            adjustments_count = await conn.fetchval('''
+                SELECT COUNT(*) FROM adjustments WHERE week_number = $1
+            ''', week_number)
+
+            await conn.execute('''
+                DELETE FROM adjustments WHERE week_number = $1
+            ''', week_number)
+
+            logger.warning(
+                f"🗑️ Deleted Week {week_number} data: "
+                f"{submissions_count} submissions, {adjustments_count} adjustments"
+            )
+
+            message = (
+                f"Week {week_number} data deleted:\n"
+                f"• {submissions_count} submissions removed\n"
+                f"• {adjustments_count} adjustments removed\n"
+                f"Participants remain intact."
+            )
+
+            return (True, message, submissions_count or 0, adjustments_count or 0)
+
+
 # ============================================================================
 # LEADERBOARD OPERATIONS
 # ============================================================================
