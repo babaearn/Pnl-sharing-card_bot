@@ -36,6 +36,7 @@ from utils import (
     TOPIC_ID,
     ADMIN_IDS,
     is_admin,
+    normalize_participant_code,
     SensitiveFormatter
 )
 
@@ -652,7 +653,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    participant_code = context.args[0]
+    participant_code = normalize_participant_code(context.args[0])
     week_number = None
 
     if len(context.args) == 2:
@@ -830,12 +831,7 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    participant_code = context.args[0]
-
-    # Confirmation check
-    if not participant_code.startswith('#'):
-        await update.message.reply_text("❌ Code must start with # (e.g., #01)")
-        return
+    participant_code = normalize_participant_code(context.args[0])
 
     # Perform deletion
     success, message = await db.delete_participant(participant_code)
@@ -1062,7 +1058,7 @@ async def cmd_breakdown(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    participant_code = context.args[0]
+    participant_code = normalize_participant_code(context.args[0])
     week = None
 
     if len(context.args) >= 2:

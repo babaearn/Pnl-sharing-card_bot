@@ -109,6 +109,31 @@ def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 
+def normalize_participant_code(code: str) -> str:
+    """
+    Normalize participant code by ensuring it has # prefix.
+
+    Examples:
+        "33" -> "#33"
+        "#33" -> "#33"
+        "01" -> "#01"
+        "#01" -> "#01"
+
+    Args:
+        code: Participant code (with or without # prefix)
+
+    Returns:
+        str: Normalized code with # prefix
+    """
+    code = code.strip()
+    if not code.startswith('#'):
+        # Pad single digit with leading zero if needed
+        if code.isdigit() and len(code) == 1:
+            return f"#{code.zfill(2)}"
+        return f"#{code}"
+    return code
+
+
 def format_timestamp(dt):
     """
     Format datetime to IST string.
