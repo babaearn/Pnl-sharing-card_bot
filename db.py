@@ -304,6 +304,24 @@ async def get_next_code() -> str:
             return code
 
 
+async def get_participant_id_by_code(code: str) -> Optional[int]:
+    """
+    Get participant ID by code.
+
+    Args:
+        code: Participant code (e.g., '#01')
+
+    Returns:
+        int: participant_id or None if not found
+    """
+    async with _pool.acquire() as conn:
+        participant_id = await conn.fetchval(
+            'SELECT id FROM participants WHERE code = $1',
+            code
+        )
+        return participant_id
+
+
 async def get_or_create_participant(
     tg_user_id: Optional[int],
     username: Optional[str],

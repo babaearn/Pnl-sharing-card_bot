@@ -35,6 +35,7 @@ from utils import (
     CHAT_ID,
     TOPIC_ID,
     ADMIN_IDS,
+    MAX_WEEK,
     is_admin,
     normalize_participant_code,
     SensitiveFormatter
@@ -581,8 +582,8 @@ async def cmd_rankerinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         try:
             week = int(context.args[0])
-            if week < 1:
-                await update.message.reply_text("❌ Week number must be 1 or greater")
+            if week < 1 or week > MAX_WEEK:
+                await update.message.reply_text(f"❌ Week number must be between 1 and {MAX_WEEK}")
                 return
         except ValueError:
             await update.message.reply_text("❌ Invalid week number. Usage: /rankerinfo or /rankerinfo 1")
@@ -689,6 +690,12 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
 
                 week_number = int(match.group())
+
+                # Validate week number
+                if week_number < 1 or week_number > MAX_WEEK:
+                    await update.message.reply_text(f"❌ Week number must be between 1 and {MAX_WEEK}")
+                    return
+
                 week_label = f"Week {week_number}"
 
         try:
@@ -768,6 +775,11 @@ async def cmd_bulkadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(f"❌ Invalid week: {week_str}")
                     return
                 week_number = int(match.group())
+
+                # Validate week number
+                if week_number < 1 or week_number > MAX_WEEK:
+                    await update.message.reply_text(f"❌ Week number must be between 1 and {MAX_WEEK}")
+                    return
 
         # Parse delta
         try:
@@ -1006,8 +1018,8 @@ async def cmd_current(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Label is everything after the week number
         label = " ".join(args[1:]) if len(args) > 1 else None
 
-    if week_number < 1:
-        await update.message.reply_text("❌ Week number must be 1 or greater")
+    if week_number < 1 or week_number > MAX_WEEK:
+        await update.message.reply_text(f"❌ Week number must be between 1 and {MAX_WEEK}")
         return
 
     # Set current week
@@ -1043,8 +1055,8 @@ async def cmd_setweek(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         week_number = int(context.args[0])
-        if week_number < 1:
-            await update.message.reply_text("❌ Week number must be 1 or greater")
+        if week_number < 1 or week_number > MAX_WEEK:
+            await update.message.reply_text(f"❌ Week number must be between 1 and {MAX_WEEK}")
             return
     except ValueError:
         await update.message.reply_text("❌ Week number must be a number")
@@ -1121,8 +1133,8 @@ async def cmd_breakdown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) >= 2:
         try:
             week = int(context.args[1])
-            if week < 1:
-                await update.message.reply_text("❌ Week number must be 1 or greater")
+            if week < 1 or week > MAX_WEEK:
+                await update.message.reply_text(f"❌ Week number must be between 1 and {MAX_WEEK}")
                 return
         except ValueError:
             await update.message.reply_text("❌ Week must be a number")
@@ -1290,10 +1302,11 @@ async def cmd_selectwinners(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         week = int(context.args[0])
-        if week < 1 or week > 4:
-            raise ValueError()
+        if week < 1 or week > MAX_WEEK:
+            await update.message.reply_text(f"❌ Week must be between 1 and {MAX_WEEK}")
+            return
     except ValueError:
-        await update.message.reply_text("❌ Week must be 1-4")
+        await update.message.reply_text("❌ Week number must be a number")
         return
 
     # Get current Top 5
@@ -1306,12 +1319,12 @@ async def cmd_selectwinners(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Prepare winners data
     winners = []
     for rank, entry in enumerate(leaderboard[:5], 1):
-        # Get participant ID from database
-        async with db._pool.acquire() as conn:
-            participant_id = await conn.fetchval(
-                'SELECT id FROM participants WHERE code = $1',
-                entry['code']
-            )
+        # Get participant ID using db helper
+        participant_id = await db.get_participant_id_by_code(entry['code'])
+
+        if participant_id is None:
+            logger.error(f"Could not find participant ID for code {entry['code']}")
+            continue
 
         winners.append({
             'rank': rank,
@@ -1343,10 +1356,11 @@ async def cmd_winners(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         week = int(context.args[0])
-        if week < 1 or week > 4:
-            raise ValueError()
+        if week < 1 or week > MAX_WEEK:
+            await update.message.reply_text(f"❌ Week must be between 1 and {MAX_WEEK}")
+            return
     except ValueError:
-        await update.message.reply_text("❌ Week must be 1-4")
+        await update.message.reply_text("❌ Week number must be a number")
         return
 
     # Get winners

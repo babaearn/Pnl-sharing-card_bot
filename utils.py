@@ -27,6 +27,9 @@ TOPIC_ID = int(os.getenv('TOPIC_ID', '103380'))
 # Admin IDs from environment (comma-separated)
 ADMIN_IDS = [int(x.strip()) for x in os.getenv('ADMIN_IDS', '1064156047').split(',')]
 
+# Maximum week number (campaign has 4 weeks, but allow up to 10 for extensions)
+MAX_WEEK = 10
+
 
 def calculate_week_number(timestamp):
     """
