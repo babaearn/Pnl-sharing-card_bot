@@ -916,6 +916,33 @@ async def cmd_setweek(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 @dm_only
+async def cmd_recalculate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /recalculate - Recalculate cumulative points from all submissions.
+
+    Use this after restoring data with /undodata or if points get out of sync.
+    Counts all submissions for each participant and updates their total points.
+    """
+    await update.message.reply_text("♻️ Recalculating cumulative points...")
+
+    participants_updated, summary = await db.recalculate_cumulative_points()
+
+    if participants_updated == 0:
+        await update.message.reply_text("✅ All cumulative points are correct!\n\nNo updates needed.")
+    else:
+        response = (
+            f"✅ Recalculation Complete!\n\n"
+            f"Updated {participants_updated} participant(s):\n\n"
+            f"{summary}\n\n"
+            f"Cumulative points are now synced with submissions!"
+        )
+        await update.message.reply_text(response)
+
+    logger.info(f"Admin {update.effective_user.id} recalculated points: {participants_updated} updated")
+
+
+@admin_only
+@dm_only
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /stats - Show engagement statistics since last reset.
@@ -1105,6 +1132,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /setweek 2 week2 - Set to Week 2 labeled "week2"
 /removedata 4 - Delete all data from week 4
 /undodata 4 - Restore deleted week 4 data
+/recalculate - Fix cumulative points (use after undo)
 
 **Settings:**
 /pointson - Show points in public leaderboard
@@ -1298,6 +1326,7 @@ def main():
     application.add_handler(CommandHandler('undodata', cmd_undodata))
     application.add_handler(CommandHandler('new', cmd_new))
     application.add_handler(CommandHandler('setweek', cmd_setweek))
+    application.add_handler(CommandHandler('recalculate', cmd_recalculate))
     application.add_handler(CommandHandler('stats', cmd_stats))
     application.add_handler(CommandHandler('reset', cmd_reset))
     application.add_handler(CommandHandler('pointson', cmd_pointson))

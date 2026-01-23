@@ -609,6 +609,63 @@ async def restore_week_data(week_number: int) -> Tuple[bool, str, int, int]:
             return (True, message, submissions_in_backup or 0, adjustments_in_backup or 0)
 
 
+async def recalculate_cumulative_points() -> Tuple[int, str]:
+    """
+    Recalculate cumulative points for all participants from submissions.
+    Use this after restoring data or if points get out of sync.
+
+    Returns:
+        Tuple[int, str]: (participants_updated, summary_message)
+    """
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            # Count submissions for each participant (all weeks)
+            submission_counts = await conn.fetch('''
+                SELECT participant_id, COUNT(*) as total_submissions
+                FROM submissions
+                GROUP BY participant_id
+            ''')
+
+            participants_updated = 0
+            updates = []
+
+            for row in submission_counts:
+                participant_id = row['participant_id']
+                correct_points = row['total_submissions']
+
+                # Get current points and participant info
+                participant = await conn.fetchrow('''
+                    SELECT code, display_name, points FROM participants WHERE id = $1
+                ''', participant_id)
+
+                if participant:
+                    old_points = participant['points']
+
+                    # Update if points don't match
+                    if old_points != correct_points:
+                        await conn.execute('''
+                            UPDATE participants SET points = $1, updated_at = now()
+                            WHERE id = $2
+                        ''', correct_points, participant_id)
+
+                        participants_updated += 1
+                        updates.append(
+                            f"{participant['code']} {participant['display_name']}: "
+                            f"{old_points} → {correct_points} pts"
+                        )
+
+            logger.info(f"♻️ Recalculated points for {participants_updated} participants")
+
+            if participants_updated == 0:
+                return (0, "All cumulative points are correct! No updates needed.")
+            else:
+                summary = "\n".join(updates[:10])  # Show first 10
+                if len(updates) > 10:
+                    summary += f"\n... and {len(updates) - 10} more"
+
+                return (participants_updated, summary)
+
+
 # ============================================================================
 # LEADERBOARD OPERATIONS
 # ============================================================================
