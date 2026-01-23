@@ -573,6 +573,38 @@ async def get_week_label() -> str:
         return result or "Week 1"
 
 
+async def set_current_week(week_number: int, label: Optional[str] = None) -> Tuple[int, str]:
+    """
+    Manually set the current week number and label.
+    Use with caution - this overrides the week counter.
+
+    Args:
+        week_number: Week number to set (must be >= 1)
+        label: Optional custom label (defaults to "Week N")
+
+    Returns:
+        Tuple[int, str]: (week_number, label)
+    """
+    if week_number < 1:
+        raise ValueError("Week number must be >= 1")
+
+    if label is None:
+        label = f"Week {week_number}"
+
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute('''
+                UPDATE settings SET value = $1 WHERE key = 'current_week'
+            ''', str(week_number))
+
+            await conn.execute('''
+                UPDATE settings SET value = $1 WHERE key = 'week_label'
+            ''', label)
+
+            logger.info(f"⚙️ Manually set week to: Week {week_number} ({label})")
+            return (week_number, label)
+
+
 async def start_new_week(label: Optional[str] = None) -> Tuple[str, str, int, int]:
     """
     Start a new week by incrementing the week counter.

@@ -785,6 +785,49 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 @dm_only
+async def cmd_setweek(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /setweek 2 - Set current week to Week 2
+    /setweek 2 week2 - Set current week to 2 with label "week2"
+
+    Use this to fix week number issues. Use with caution!
+    """
+    if len(context.args) < 1:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/setweek 2 - Set to Week 2\n"
+            "/setweek 2 week2 - Set to Week 2 labeled 'week2'"
+        )
+        return
+
+    try:
+        week_number = int(context.args[0])
+        if week_number < 1:
+            await update.message.reply_text("❌ Week number must be 1 or greater")
+            return
+    except ValueError:
+        await update.message.reply_text("❌ Week number must be a number")
+        return
+
+    # Get label from remaining arguments
+    label = " ".join(context.args[1:]) if len(context.args) > 1 else None
+
+    # Set current week
+    week_number, label = await db.set_current_week(week_number, label)
+
+    message = (
+        f"⚙️ Week Manually Set!\n\n"
+        f"✅ Current week is now: {label} (Week {week_number})\n\n"
+        f"New submissions will count toward {label}.\n"
+        f"Use /pnlrank to see the current week leaderboard."
+    )
+
+    await update.message.reply_text(message)
+    logger.warning(f"Admin {update.effective_user.id} manually set week to {week_number} ({label})")
+
+
+@admin_only
+@dm_only
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /stats - Show engagement statistics since last reset.
@@ -970,6 +1013,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /new - Start new week (auto-numbered)
 /new week2 - Start "week2" (custom label)
 /new week 3 - Start "week 3" (custom label)
+/setweek 2 - Manually set to Week 2
+/setweek 2 week2 - Set to Week 2 labeled "week2"
 
 **Settings:**
 /pointson - Show points in public leaderboard
@@ -1160,6 +1205,7 @@ def main():
     application.add_handler(CommandHandler('add', cmd_add))
     application.add_handler(CommandHandler('remove', cmd_remove))
     application.add_handler(CommandHandler('new', cmd_new))
+    application.add_handler(CommandHandler('setweek', cmd_setweek))
     application.add_handler(CommandHandler('stats', cmd_stats))
     application.add_handler(CommandHandler('reset', cmd_reset))
     application.add_handler(CommandHandler('pointson', cmd_pointson))
