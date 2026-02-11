@@ -6,11 +6,18 @@ All operations are crash-safe, idempotent, and use transactions.
 """
 
 import os
+import asyncio
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 import asyncpg
 import logging
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple
 from utils import IST
+
+# Connection settings (tune for cold start / Railway)
+CONNECT_TIMEOUT = int(os.getenv('DB_CONNECT_TIMEOUT', '120'))  # seconds per attempt
+CONNECT_RETRIES = int(os.getenv('DB_CONNECT_RETRIES', '3'))
+CONNECT_RETRY_DELAY = float(os.getenv('DB_CONNECT_RETRY_DELAY', '5.0'))
 
 logger = logging.getLogger(__name__)
 
@@ -18,16 +25,22 @@ logger = logging.getLogger(__name__)
 _pool: Optional[asyncpg.Pool] = None
 
 
+def _ensure_sslmode(url: str, default: str = "require") -> str:
+    """Ensure DATABASE_URL has sslmode set (needed for Railway and most cloud Postgres)."""
+    if "sslmode=" in url.lower():
+        return url
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    query["sslmode"] = [default]
+    new_query = urlencode(query, doseq=True)
+    new = parsed._replace(query=new_query)
+    return urlunparse(new)
+
+
 async def init_db() -> asyncpg.Pool:
     """
     Initialize database connection pool and create tables if not exist.
-
-    Returns:
-        asyncpg.Pool: Database connection pool
-
-    Raises:
-        ValueError: If DATABASE_URL is not set
-        Exception: If database connection fails
+    Uses retries and longer connection timeout for Railway/cold start.
     """
     global _pool
 
@@ -39,33 +52,44 @@ async def init_db() -> asyncpg.Pool:
             "and add Variable Reference to your service."
         )
 
-    # Mask DATABASE_URL in logs for security
+    database_url = _ensure_sslmode(database_url)
     masked_url = database_url[:15] + "***" + database_url[-10:] if len(database_url) > 25 else "***"
-    logger.info(f"🗄️ Connecting to PostgreSQL: {masked_url}")
+    logger.info(f"🗄️ Connecting to PostgreSQL: {masked_url} (timeout={CONNECT_TIMEOUT}s, retries={CONNECT_RETRIES})")
 
-    try:
-        # Create connection pool
-        _pool = await asyncpg.create_pool(
-            database_url,
-            min_size=2,
-            max_size=10,
-            command_timeout=60
-        )
+    last_error = None
+    for attempt in range(1, CONNECT_RETRIES + 1):
+        try:
+            logger.info(f"🔄 Connection attempt {attempt}/{CONNECT_RETRIES}...")
+            _pool = await asyncpg.create_pool(
+                database_url,
+                min_size=2,
+                max_size=10,
+                timeout=CONNECT_TIMEOUT,
+                command_timeout=60,
+            )
+            logger.info("✅ Database connection pool created")
+            await create_tables()
+            await initialize_settings()
+            logger.info("✅ Database initialized successfully")
+            return _pool
+        except (TimeoutError, asyncio.TimeoutError, OSError, ConnectionError) as e:
+            last_error = e
+            logger.warning(f"⚠️ Attempt {attempt}/{CONNECT_RETRIES} failed: {e}")
+            if _pool is not None:
+                try:
+                    await _pool.close()
+                except Exception:
+                    pass
+                _pool = None
+            if attempt < CONNECT_RETRIES:
+                logger.info(f"⏳ Retrying in {CONNECT_RETRY_DELAY}s...")
+                await asyncio.sleep(CONNECT_RETRY_DELAY)
+        except Exception as e:
+            logger.error(f"❌ Database initialization failed: {e}")
+            raise
 
-        logger.info("✅ Database connection pool created")
-
-        # Create tables
-        await create_tables()
-
-        # Initialize settings if empty
-        await initialize_settings()
-
-        logger.info("✅ Database initialized successfully")
-        return _pool
-
-    except Exception as e:
-        logger.error(f"❌ Database initialization failed: {e}")
-        raise
+    logger.error(f"❌ Database initialization failed after {CONNECT_RETRIES} attempts: {last_error}")
+    raise last_error
 
 
 async def create_tables():
